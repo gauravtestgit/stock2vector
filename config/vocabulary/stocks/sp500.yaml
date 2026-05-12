@@ -1,0 +1,57 @@
+scraped_at: "2025-04-10T00:00:00+00:00"
+source: "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+count: 50
+tickers:
+  - AAPL
+  - ABBV
+  - ABT
+  - ADBE
+  - AMD
+  - AMGN
+  - AMZN
+  - AVGO
+  - BAC
+  - BRK.B
+  - CAT
+  - COP
+  - COST
+  - CRM
+  - CSCO
+  - CVX
+  - DHR
+  - DIS
+  - GOOGL
+  - GS
+  - HD
+  - HON
+  - IBM
+  - INTC
+  - JNJ
+  - JPM
+  - KO
+  - LIN
+  - LLY
+  - MA
+  - MCD
+  - META
+  - MRK
+  - MS
+  - MSFT
+  - NEE
+  - NFLX
+  - NVDA
+  - ORCL
+  - PEP
+  - PFE
+  - PG
+  - QCOM
+  - RTX
+  - SBUX
+  - T
+  - TGT
+  - TSLA
+  - UNH
+  - V
+  - VZ
+  - WMT
+  - XOM

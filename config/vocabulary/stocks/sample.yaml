@@ -1,0 +1,11 @@
+scraped_at: "2025-04-10T00:00:00+00:00"
+source: "manual"
+count: 30
+tickers:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - META
+  - TSLA
+  - NVDA

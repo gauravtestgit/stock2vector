@@ -1,0 +1,1827 @@
+I am building a semi-professional stock analysis application called Stock2Vec.
+It applies Word2Vec-style embedding training to stock price co-movement data
+to discover behavioural relationships between stocks across multiple markets.
+
+I have a complete functional specification, system architecture, and design
+principles. Implement everything faithfully across multiple tasks.
+Do not add features not specified.
+Do not use PyTorch, TensorFlow, or any deep learning framework.
+All model training must use numpy only.
+Wait for my confirmation before starting each new task.
+Do not proceed to the next task until I explicitly say to continue.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — CORE CONCEPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each trading day is treated as a sentence.
+Each stock that moves meaningfully on that day is a word.
+Stocks that co-move frequently end up with similar embedding vectors.
+Cosine similarity between vectors measures behavioural similarity.
+No labels, sector data, or human annotation used at any point.
+
+The training loop is standard Word2Vec skip-gram in numpy:
+
+  h      = W1[center_idx]
+  scores = h @ W2
+  probs  = softmax(scores)
+  loss   = -log(probs[target_idx] + 1e-9)
+
+  dscores = probs.copy()
+  dscores[target_idx] -= 1        # CRITICAL: -= 1 never = -1
+                                  # = -1 causes silent divergence
+
+  dW2 = np.outer(h, dscores)
+  dh  = W2 @ dscores
+  dW2 = np.clip(dW2, -1.0, 1.0)
+  dh  = np.clip(dh,  -1.0, 1.0)
+  W2             -= lr * dW2
+  W1[center_idx] -= lr * dh
+
+W1 is kept after training as the embedding table.
+W2 is discarded after training.
+Loss is computed for monitoring only.
+Loss value never appears in weight update calculations.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — SOLID DESIGN PRINCIPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Apply SOLID principles throughout every task without exception.
+This section takes precedence over all structural decisions elsewhere.
+
+SINGLE RESPONSIBILITY:
+  every class has exactly one reason to change
+  Word2VecModel handles math only — no file IO no logging
+  observers handle side effects only — no math
+  Trainer orchestrates only — no math no file IO
+  separate classes for HTTP fetch caching cleaning
+  returns computation and pair generation
+
+OPEN/CLOSED:
+  all extension via new implementations of interfaces
+  never modify existing working implementations
+  OOVStrategyFactory maps string keys to IOOVStrategy classes
+  adding new OOV method means new file plus factory entry
+  zero existing files touched
+  same pattern for data sources clustering strategies
+  threshold strategies and lr strategies
+
+LISKOV SUBSTITUTION:
+  all implementations fully honour their interface contract
+  any IReturnsProcessor can replace any other transparently
+  any IOOVStrategy can replace any other transparently
+  callers never inspect concrete type
+  never use isinstance checks in business logic
+
+INTERFACE SEGREGATION:
+  dashboard page 2 depends on IStockProfiler only
+  dashboard page 4 depends on IPortfolioAnalyser only
+  no page depends on a fat combined query interface
+  Trainer depends on IEmbeddingModel not Word2VecModel
+  each consumer depends only on the methods it uses
+
+DEPENDENCY INVERSION:
+  all high-level modules depend on interfaces not concretions
+  all concrete wiring lives in config/container.py only
+  constructor injection throughout the entire codebase
+  no class instantiates its own dependencies internally
+  unit tests inject mocks via constructor
+  changing an implementation means changing container.py only
+
+INTERFACES:
+  all abstract base classes in src/interfaces/
+  using Python ABC and abstractmethod decorators
+  every interface has a docstring stating its contract
+  every method has a docstring stating preconditions
+  and postconditions
+
+RESULT TYPES:
+  all query results use typed dataclasses
+  defined in src/models/results.py
+  no raw dicts returned from query layer to dashboard
+  dashboard formatters convert dataclasses to
+  Plotly-compatible structures
+  dataclasses use field(default_factory=...) for mutable defaults
+
+DEPENDENCY INJECTION CONTAINER:
+  config/container.py contains ServiceContainer class
+  single place where all implementations are wired together
+  dashboard/app.py creates one ServiceContainer instance
+  passes it to all page modules
+  tests create container with mock implementations injected
+
+TESTS USE INTERFACES NOT CONCRETIONS:
+  unit tests inject mocks via constructor
+  no unit test touches filesystem or network
+  integration tests use real implementations on small sample data
+  mock implementations in tests/fixtures/
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — FOUR MODEL ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The system trains four independent models.
+Each model is self-contained with its own vocab weights and metadata.
+
+MODEL 1 — US
+  vocab:
+    S&P 500 components scraped from Wikipedia on each full retrain
+    NASDAQ 100 components scraped from Wikipedia on each full retrain
+    US Tier A anchor ETFs 44 instruments defined in Section 4
+    approximately 550 unique instruments after dedup
+  anchors:
+    US Tier A ETFs included in vocab and training pairs
+    define the coordinate system of the embedding space
+  returns:    daily log returns
+  purpose:    primary US market model richest embeddings
+
+MODEL 2 — NZX
+  vocab:
+    all NZX listed stocks approximately 180 tickers .NZ suffix
+    hardcoded list in universe.yaml NZX changes slowly
+    no anchors stocks only
+    download all attempt keep those with sufficient history
+    typically 120-150 successfully download log all failures
+  returns:    daily log returns NZ session
+  purpose:    within-NZ cluster discovery only
+              no cross-market claims made by this model
+  note:
+    US Tier A ETFs NOT used in this model
+    daily NZX and US ETF returns correspond to different sessions
+    timezone misalignment makes daily co-movement unreliable
+    cross-market analysis handled exclusively by Global model
+
+MODEL 3 — ASX
+  vocab:
+    ASX 300 components scraped from Wikipedia on each full retrain
+    approximately 300 stocks .AX suffix
+    ASX sector anchor ETFs defined in Section 4
+    commodity and FX anchors defined in Section 4
+  anchors:
+    ASX sector ETFs trade in same timezone as ASX stocks
+    reliable co-movement signal
+    US Tier A ETFs NOT used same timezone reason as NZX
+  returns:    daily log returns AU session
+  purpose:    within-AU cluster discovery and ASX factor exposures
+
+MODEL 4 — GLOBAL
+  vocab:
+    union of all stocks from US plus NZX plus ASX models
+    US Tier A anchor ETFs same 44 instruments as US model
+    approximately 1030 unique instruments total
+  anchors:
+    US Tier A ETFs work here because weekly returns eliminate
+    the timezone problem all markets reflect same macro week
+  returns:
+    weekly log returns
+    prices.resample("W-FRI").last() then log returns
+    W-FRI anchors week end to Friday consistent across markets
+  purpose:
+    cross-market analysis — the ONLY model for cross-market queries
+    NZX and ASX stocks get positions relative to US anchors
+    via weekly co-movement
+  training order:
+    always trains last depends on data from US NZX ASX
+
+TIMEZONE RATIONALE:
+  Monday NZX session corresponds to US Sunday no US trading
+  Daily co-movement between NZX/ASX and US instruments
+  compares returns from different actual trading sessions
+  Weekly returns solve this both markets reflect same macro week
+  US Tier A ETFs used ONLY in US model and Global model
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — UNIVERSE DEFINITION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+US TIER A ANCHORS — used in US model and Global model only
+
+  market_etfs:
+    SPY: "S&P 500"       QQQ: "NASDAQ 100"    IWM: "Russell 2000"
+    DIA: "Dow Jones"     VTI: "Total market"
+
+  sector_etfs:
+    XLK: "Technology"           XLF: "Financials"
+    XLE: "Energy"               XLV: "Healthcare"
+    XLI: "Industrials"          XLY: "Consumer discretionary"
+    XLP: "Consumer staples"     XLU: "Utilities"
+    XLB: "Materials"            XLRE: "Real estate"
+    XLC: "Communication services"
+
+  factor_etfs:
+    VUG: "Growth"          VTV: "Value"         MTUM: "Momentum"
+    USMV: "Low volatility" QUAL: "Quality"      VIG: "Dividend growth"
+    SCHA: "Small cap"
+
+  macro:
+    TLT: "20yr Treasury"   SHY: "2yr Treasury"  TIP: "TIPS inflation"
+    GLD: "Gold"            SLV: "Silver"         DBA: "Agriculture"
+    USO: "Oil"             UNG: "Natural gas"    UUP: "USD index"
+    HYG: "High yield credit"                     LQD: "Investment grade credit"
+
+  thematic:
+    SOXX: "Semiconductors"  ITA: "Defense"       URA: "Uranium"
+    ICLN: "Clean energy"    ARKK: "Innovation"   ROBO: "Robotics AI"
+    HACK: "Cybersecurity"   FINX: "Fintech"      IBB: "Biotech"
+
+ASX ANCHORS — used in ASX model only
+
+  sector_etfs:
+    XMJ.AX: "ASX materials"    XEJ.AX: "ASX energy"
+    XFJ.AX: "ASX financials"   XHJ.AX: "ASX healthcare"
+    XNJ.AX: "ASX industrials"  XPJ.AX: "ASX property"
+    XTJ.AX: "ASX telco"        XUJ.AX: "ASX utilities"
+
+  commodities_and_fx:
+    GC=F: "Gold futures"    CL=F: "Crude oil futures"
+    HG=F: "Copper futures"  AUDUSD=X: "AUD/USD exchange rate"
+
+NZX STOCK UNIVERSE — hardcoded no anchors
+  IFT.NZ  ATM.NZ  FPH.NZ  MEL.NZ  CEN.NZ  MCY.NZ  GNE.NZ
+  SPK.NZ  AIA.NZ  EBO.NZ  RYM.NZ  SUM.NZ  PCT.NZ  ARG.NZ
+  GMT.NZ  PFI.NZ  AFT.NZ  VHP.NZ  MHJ.NZ  KMD.NZ  HLG.NZ
+  STU.NZ  PPH.NZ  THL.NZ  WBC.NZ  ANZ.NZ  SCL.NZ  SAN.NZ
+  NZM.NZ  CVT.NZ  ALF.NZ  NZK.NZ  SKC.NZ  TPW.NZ  GTK.NZ
+  IKE.NZ  WIN.NZ  NZR.NZ  PEB.NZ  RUA.NZ  TRA.NZ  BRM.NZ
+  FWL.NZ  MOV.NZ  NWF.NZ  OCA.NZ  CMO.NZ  SKT.NZ  SML.NZ
+  MFT.NZ
+
+US DYNAMIC UNIVERSE — scraped on each full retrain
+  S&P 500:    https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
+              column Symbol
+  NASDAQ 100: https://en.wikipedia.org/wiki/Nasdaq-100
+              column Ticker
+
+ASX DYNAMIC UNIVERSE — scraped on each full retrain
+  ASX 300:    https://en.wikipedia.org/wiki/S%26P/ASX_300
+              column Code append .AX suffix
+
+VOCAB STABILITY RULE:
+  once a ticker enters any model vocab it stays forever
+  new tickers added on full retrain
+  no ticker ever removed
+  anchors always in vocab never removed
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5 — INTERFACES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All abstract base classes live in src/interfaces/.
+All use Python ABC and abstractmethod.
+All have docstrings stating contract.
+
+src/interfaces/data.py
+
+  class IPriceSource(ABC):
+    @abstractmethod
+    def fetch(self, tickers: list[str],
+              start: str, end: str) -> pd.DataFrame:
+      """Fetch OHLCV prices. Returns DataFrame with tickers as columns
+         date as index. Missing tickers silently omitted not raised."""
+
+  class ICache(ABC):
+    @abstractmethod
+    def read(self, key: str) -> pd.DataFrame | None: ...
+    @abstractmethod
+    def write(self, key: str, df: pd.DataFrame) -> None: ...
+    @abstractmethod
+    def exists(self, key: str) -> bool: ...
+    @abstractmethod
+    def get_last_date(self, key: str) -> date | None: ...
+
+  class IDataCleaner(ABC):
+    @abstractmethod
+    def clean(self, prices: pd.DataFrame) -> pd.DataFrame:
+      """Returns cleaned prices. Never raises on individual ticker
+         issues. Logs warnings for anomalies."""
+
+  class IReturnsProcessor(ABC):
+    @abstractmethod
+    def compute(self, prices: pd.DataFrame) -> pd.DataFrame:
+      """Returns log returns DataFrame same shape minus first row."""
+
+  class IThresholdStrategy(ABC):
+    @abstractmethod
+    def compute(self, returns: pd.DataFrame) -> float:
+      """Returns co-movement threshold as positive float."""
+
+  class IPairGenerator(ABC):
+    @abstractmethod
+    def generate(self, returns: pd.DataFrame,
+                 t2i: dict[str, int],
+                 threshold: float) -> list[tuple[int, int]]:
+      """Returns list of (center_idx, target_idx) integer tuples.
+         All pairs are bidirectional. Capped per day."""
+
+src/interfaces/model.py
+
+  class IEmbeddingModel(ABC):
+    @abstractmethod
+    def initialise(self, vocab_size: int,
+                   embed_dim: int, seed: int) -> None: ...
+    @abstractmethod
+    def forward(self, center_idx: int
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+      """Returns (h, scores, probs)."""
+    @abstractmethod
+    def backward(self, h: np.ndarray, probs: np.ndarray,
+                 target_idx: int
+                 ) -> tuple[np.ndarray, np.ndarray]:
+      """Returns (dW2, dh).
+         CRITICAL: uses probs[target_idx] -= 1 never = -1"""
+    @abstractmethod
+    def update(self, center_idx: int, dW2: np.ndarray,
+               dh: np.ndarray, lr: float) -> None: ...
+    @abstractmethod
+    def get_embeddings(self) -> np.ndarray: ...
+
+  class ITrainingObserver(ABC):
+    @abstractmethod
+    def on_epoch_start(self, epoch: int) -> None: ...
+    @abstractmethod
+    def on_epoch_end(self, epoch: int, avg_loss: float) -> None: ...
+    @abstractmethod
+    def on_training_complete(self, final_loss: float) -> None: ...
+    @abstractmethod
+    def on_checkpoint(self, epoch: int,
+                      W1: np.ndarray) -> None: ...
+    @abstractmethod
+    def on_error(self, error: Exception) -> None: ...
+
+  class ILRStrategy(ABC):
+    @abstractmethod
+    def select(self, model: IEmbeddingModel,
+               pairs: list[tuple[int, int]]) -> float: ...
+
+  class IGradientClipper(ABC):
+    @abstractmethod
+    def clip(self, gradient: np.ndarray) -> np.ndarray: ...
+
+  class IEarlyStopper(ABC):
+    @abstractmethod
+    def should_stop(self,
+                    loss_history: list[float]) -> bool: ...
+
+  class IModelPersistence(ABC):
+    @abstractmethod
+    def save(self, model: IEmbeddingModel,
+             vocab: dict, metadata: dict,
+             path: Path) -> None: ...
+    @abstractmethod
+    def load(self, path: Path
+             ) -> tuple[np.ndarray, dict, dict]: ...
+
+src/interfaces/embeddings.py
+
+  class ISimilarityMetric(ABC):
+    @abstractmethod
+    def compute(self, a: np.ndarray,
+                b: np.ndarray) -> float: ...
+    @abstractmethod
+    def compute_matrix(self,
+                       embeddings: np.ndarray) -> np.ndarray: ...
+
+  class IClusteringStrategy(ABC):
+    @abstractmethod
+    def cluster(self, embeddings: np.ndarray,
+                t2i: dict[str, int],
+                **kwargs) -> dict[int, list[str]]: ...
+
+  class IOOVStrategy(ABC):
+    @abstractmethod
+    def estimate(self, ticker: str,
+                 new_returns: pd.Series,
+                 model_data: ModelData
+                 ) -> tuple[np.ndarray, OOVMetadata] | None:
+      """Returns None if insufficient co-movement data."""
+
+  class IAnchorProfiler(ABC):
+    @abstractmethod
+    def profile(self, ticker: str,
+                embeddings: np.ndarray,
+                t2i: dict[str, int],
+                anchor_tickers: list[str]
+                ) -> dict[str, float]:
+      """Returns empty dict when anchor_tickers is empty.
+         This handles NZX model transparently."""
+
+src/interfaces/queries.py
+
+  class IStockProfiler(ABC):
+    @abstractmethod
+    def profile(self, ticker: str,
+                model_data: ModelData,
+                fresh_returns: pd.DataFrame | None = None
+                ) -> ProfileResult: ...
+
+  class IStockComparator(ABC):
+    @abstractmethod
+    def compare(self, ticker_a: str, ticker_b: str,
+                model_data: ModelData
+                ) -> ComparisonResult: ...
+
+  class IPortfolioAnalyser(ABC):
+    @abstractmethod
+    def analyse(self, tickers: list[str],
+                model_data: ModelData
+                ) -> PortfolioResult: ...
+
+  class ISimilaritySearcher(ABC):
+    @abstractmethod
+    def search(self, ticker: str,
+               model_data: ModelData,
+               market_filter: str | None,
+               min_similarity: float
+               ) -> list[SearchResult]: ...
+
+  class ICrossMarketSearcher(ABC):
+    @abstractmethod
+    def find_equivalent(self, source_ticker: str,
+                        target_market: str,
+                        global_model_data: ModelData
+                        ) -> list[SearchResult]: ...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — RESULT DATACLASSES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All in src/models/results.py.
+All use @dataclass decorator.
+Mutable defaults use field(default_factory=...).
+No raw dicts returned from query layer.
+
+  @dataclass
+  class SimilarStock:
+    ticker:   str
+    score:    float
+    market:   str
+    in_vocab: bool
+
+  @dataclass
+  class AnchorProfile:
+    sector:   dict[str, float] = field(default_factory=dict)
+    factor:   dict[str, float] = field(default_factory=dict)
+    macro:    dict[str, float] = field(default_factory=dict)
+    thematic: dict[str, float] = field(default_factory=dict)
+
+  @dataclass
+  class OOVMetadata:
+    method:           str
+    co_movement_days: int
+    confidence:       str
+    top_5_comovers:   list[tuple[str, float]]
+    data_days_used:   int
+
+  @dataclass
+  class ProfileResult:
+    ticker:          str
+    market:          str
+    in_vocab:        bool
+    embedding:       np.ndarray
+    similar:         list[SimilarStock]
+    anchor_profile:  AnchorProfile
+    cluster_id:      int | None
+    cluster_members: list[str]
+    oov_metadata:    OOVMetadata | None = None
+
+  @dataclass
+  class ComparisonResult:
+    ticker_a:           str
+    ticker_b:           str
+    similarity:         float
+    profile_a:          ProfileResult
+    profile_b:          ProfileResult
+    shared_neighbours:  list[str]
+    anchor_divergence:  list[tuple[str, float]]
+
+  @dataclass
+  class PortfolioResult:
+    tickers:               list[str]
+    similarity_matrix:     pd.DataFrame
+    concentration_pairs:   list[tuple[str, str, float]]
+    cross_market_matrix:   dict[str, pd.DataFrame]
+    diversification_score: float
+
+  @dataclass
+  class SearchResult:
+    ticker:     str
+    score:      float
+    market:     str
+    in_vocab:   bool
+    confidence: str | None = None
+
+  @dataclass
+  class ClusterResult:
+    cluster_id:          int
+    members:             list[str]
+    avg_internal_sim:    float
+    dominant_anchor:     str | None = None
+
+  @dataclass
+  class ModelData:
+    market:      str
+    embeddings:  np.ndarray
+    t2i:         dict[str, int]
+    i2t:         dict[int, str]
+    anchors:     dict[str, list[str]]
+    metadata:    dict
+    version:     str
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7 — CONCRETE IMPLEMENTATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DATA PIPELINE IMPLEMENTATIONS:
+
+  src/pipeline/sources.py
+    YFinancePriceSource(IPriceSource)
+      fetch() handles batching retry and rate limiting
+      batch_size retry_count retry_wait rate_limit from settings
+      never raises on individual ticker failure
+      logs failures returns available tickers only
+
+  src/pipeline/cache.py
+    ParquetCache(ICache)
+      read() write() exists() get_last_date()
+      key maps to parquet filepath under settings.raw_dir
+      get_last_date() reads last index value from parquet
+
+  src/pipeline/downloader.py
+    IncrementalDownloader
+      depends on IPriceSource and ICache via constructor
+      on first run fetches full history
+      on subsequent runs fetches only since get_last_date()
+      appends new data to existing cache
+      writes download_meta.json after each run
+      does not know whether source is yfinance or anything else
+
+  src/pipeline/cleaner.py
+    StandardCleaner(IDataCleaner)
+      forward fill maximum 5 consecutive days
+      drop ticker if fewer than min_history_pct trading days
+      drop ticker if average price below min_price
+      log anomalies to anomaly_log.csv do not drop them
+      anomaly threshold absolute return > 0.25
+
+  src/pipeline/returns.py
+    LogReturnsProcessor(IReturnsProcessor)
+      np.log(prices / prices.shift(1)).dropna()
+
+    WeeklyResampleProcessor(IReturnsProcessor)
+      decorator wrapping another IReturnsProcessor
+      applies prices.resample("W-FRI").last() first
+      then delegates to wrapped processor
+      used for global model only
+      open for extension without modifying LogReturnsProcessor
+
+  src/pipeline/threshold.py
+    VolatilityThresholdStrategy(IThresholdStrategy)
+      threshold_multiplier times mean of per-stock std
+      multiplier from settings
+
+    FixedThresholdStrategy(IThresholdStrategy)
+      returns fixed value from settings
+      used when user overrides auto threshold
+
+  src/pipeline/pairs.py
+    CoMovementPairGenerator(IPairGenerator)
+      up bucket return > threshold
+      down bucket return < negative threshold
+      all combinations within each bucket
+      bidirectional A-B and B-A both added
+      cap at max_pairs_per_day random sample if exceeded
+
+  src/pipeline/status.py
+    TrainingStatus
+      write_status(market, mode, epoch, total_epochs,
+                   loss, started_at)
+      write_complete(market, final_loss, validation_results)
+      write_failed(market, error_message)
+      read_status(market) -> dict
+      write_reload_signal(market, version)
+      check_reload_signal(market) -> bool
+
+TRAINING IMPLEMENTATIONS:
+
+  src/training/word2vec.py
+    Word2VecModel(IEmbeddingModel)
+      initialise() random W1 W2 with seed
+      forward() returns h scores probs
+      backward() returns dW2 dh
+        CRITICAL: dscores[target_idx] -= 1 never = -1
+        loss variable not computed here
+        loss computed in Trainer for monitoring only
+      update() applies lr * gradient to W1 row and W2
+      get_embeddings() returns W1 copy
+
+  src/training/observers.py
+    LossCsvObserver(ITrainingObserver)
+      on_epoch_end() appends epoch and avg_loss to CSV
+      single responsibility: CSV loss logging only
+
+    StatusFileObserver(ITrainingObserver)
+      on_epoch_end() calls TrainingStatus.write_status()
+      on_training_complete() calls write_complete()
+      on_error() calls write_failed()
+      single responsibility: status file only
+
+    CheckpointObserver(ITrainingObserver)
+      on_checkpoint() saves W1 npy file to checkpoints/
+      only fires every checkpoint_every_epochs
+      single responsibility: checkpoint saving only
+
+    DashboardNotifierObserver(ITrainingObserver)
+      on_training_complete() calls write_reload_signal()
+      single responsibility: notify dashboard only
+
+  src/training/lr_strategy.py
+    ScanLRStrategy(ILRStrategy)
+      tests each value in lr_scan_values for lr_scan_epochs
+      selects largest where final loss < starting loss
+      logs selected lr
+
+    FixedLRStrategy(ILRStrategy)
+      returns fixed lr from settings
+
+  src/training/clipping.py
+    GradientClipper(IGradientClipper)
+      np.clip(gradient, -clip_value, clip_value)
+      clip_value from settings
+
+  src/training/stopping.py
+    PatienceEarlyStopper(IEarlyStopper)
+      returns True if loss increased for patience epochs
+      patience from settings
+
+  src/training/trainer.py
+    Trainer class depends on interfaces via constructor:
+      model: IEmbeddingModel
+      lr_strategy: ILRStrategy
+      gradient_clipper: IGradientClipper
+      early_stopper: IEarlyStopper
+      observers: list[ITrainingObserver]
+      persistence: IModelPersistence
+    train(pairs, epochs) method:
+      fires observer events at each stage
+      computes loss for monitoring only
+      loss never used in model.update() call
+      shuffles pairs each epoch
+      calls early_stopper.should_stop() each epoch
+    Trainer never modified to add new behaviour
+    new behaviour added by injecting new observers
+
+  src/training/versioning.py
+    ModelVersioning
+      save() creates versioned directory writes all files
+      load() reads from current/ directory
+      list_versions() lists versioned directories
+      get_current() returns current version metadata
+      update_current() copies to current/ writes reload signal
+        ONLY called after validation suite passes
+
+  src/training/scheduler.py
+    TrainingScheduler
+      run_market(market, mode) full pipeline for one market
+      run_all(mode) runs US NZX ASX then Global in order
+
+  src/training/process.py
+    TrainingProcess
+      start(market, mode) spawns subprocess detached
+      is_running() reads status file
+      get_status() returns status dict
+
+  src/training/backup.py
+    ModelBackup
+      backup_model(market, version) compress upload S3
+      restore_model(market, version) download extract
+      list_backups(market) -> list[str]
+      skip all operations silently if S3_BACKUP_BUCKET empty
+
+EMBEDDING IMPLEMENTATIONS:
+
+  src/embeddings/metrics.py
+    CosineMetric(ISimilarityMetric)
+      compute() dot(a,b) / (norm(a) * norm(b))
+      returns 0.0 if either norm is zero
+      compute_matrix() vectorised all pairs
+
+  src/embeddings/clustering.py
+    GreedyClusterer(IClusteringStrategy)
+      assign stock to first cluster where sim > threshold
+      threshold passed as kwarg
+
+    KMeansClusterer(IClusteringStrategy)
+      uses scikit-learn KMeans
+      n_clusters passed as kwarg
+      alternative strategy open for extension
+
+  src/embeddings/oov/base.py
+    IOOVStrategy defined here (also in interfaces)
+
+  src/embeddings/oov/weighted.py
+    WeightedAverageOOV(IOOVStrategy)
+      align dates between new_returns and vocab returns
+      count co-movement days per vocab stock
+      weighted average of vocab embeddings
+      normalise to unit length
+      return embedding and OOVMetadata
+      return None if zero co-movement days
+
+  src/embeddings/oov/factory.py
+    OOVStrategyFactory
+      strategies dict maps string to class
+        "weighted_average": WeightedAverageOOV
+      create(method) -> IOOVStrategy
+      adding new strategy means new entry in dict only
+
+  src/embeddings/anchors.py
+    EtfAnchorProfiler(IAnchorProfiler)
+      profile() computes similarity to each anchor ticker
+      returns empty dict when anchor_tickers is empty list
+      NZX model passes empty list transparently
+
+QUERY IMPLEMENTATIONS:
+
+  src/queries/profiler.py
+    EmbeddingStockProfiler(IStockProfiler)
+      depends on ISimilarityMetric IAnchorProfiler IOOVFactory
+      checks if ticker in t2i
+      if yes uses W1[ticker] directly
+      if no calls oov_factory.create().estimate()
+      returns ProfileResult dataclass
+
+  src/queries/comparator.py
+    EmbeddingComparator(IStockComparator)
+      depends on ISimilarityMetric IAnchorProfiler
+      calls profiler for each ticker independently
+      computes shared neighbours and anchor divergence
+      returns ComparisonResult dataclass
+
+  src/queries/portfolio.py
+    PortfolioAnalyser(IPortfolioAnalyser)
+      always uses global model data
+      computes full similarity matrix
+      finds concentration pairs above 0.85
+      builds cross-market sub-matrices
+      computes diversification score
+      returns PortfolioResult dataclass
+
+  src/queries/search.py
+    CosineSimilaritySearcher(ISimilaritySearcher)
+      finds all stocks above min_similarity
+      applies market_filter if provided
+      returns list[SearchResult]
+
+  src/queries/cross_market.py
+    GlobalModelCrossMarketSearcher(ICrossMarketSearcher)
+      always uses global model
+      finds top N stocks in target_market
+      returns list[SearchResult]
+
+  src/queries/formatter.py
+    ResultFormatter
+      profile_to_dict(result: ProfileResult) -> dict
+      comparison_to_dict(result: ComparisonResult) -> dict
+      portfolio_to_dict(result: PortfolioResult) -> dict
+      converts dataclasses to Plotly-compatible dicts
+      single responsibility: serialisation for dashboard only
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 8 — DEPENDENCY INJECTION CONTAINER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+config/container.py
+
+  class ServiceContainer:
+    """Single place where all implementations are wired.
+    Changing an implementation means changing this file only.
+    All other code depends on interfaces."""
+
+    def __init__(self, settings: Settings):
+      self._settings = settings
+
+      # data layer
+      self._price_source = YFinancePriceSource(settings)
+      self._cache        = ParquetCache(settings.raw_dir)
+      self._cleaner      = StandardCleaner(settings)
+      self._log_returns  = LogReturnsProcessor()
+      self._weekly       = WeeklyResampleProcessor(
+                             self._log_returns)
+      self._threshold    = VolatilityThresholdStrategy(settings)
+      self._pair_gen     = CoMovementPairGenerator(settings)
+      self._downloader   = IncrementalDownloader(
+                             self._price_source,
+                             self._cache)
+
+      # training layer
+      self._lr_strategy  = ScanLRStrategy(settings)
+      self._clipper      = GradientClipper(settings)
+      self._stopper      = PatienceEarlyStopper(settings)
+      self._persistence  = NumpyPersistence()
+      self._observers    = [
+        LossCsvObserver(settings),
+        StatusFileObserver(settings),
+        CheckpointObserver(settings),
+        DashboardNotifierObserver(settings),
+      ]
+
+      # embedding layer
+      self._metric       = CosineMetric()
+      self._clusterer    = GreedyClusterer()
+      self._oov_factory  = OOVStrategyFactory()
+      self._profiler     = EtfAnchorProfiler()
+
+      # query layer
+      self._stock_profiler = EmbeddingStockProfiler(
+                               self._metric,
+                               self._profiler,
+                               self._oov_factory)
+      self._comparator   = EmbeddingComparator(
+                               self._metric,
+                               self._profiler)
+      self._port_analyser = PortfolioAnalyser(self._metric)
+      self._searcher      = CosineSimilaritySearcher(
+                               self._metric)
+      self._cross_market  = GlobalModelCrossMarketSearcher(
+                               self._metric)
+      self._formatter     = ResultFormatter()
+
+    # expose interfaces only never concrete types
+
+    @property
+    def downloader(self) -> IncrementalDownloader: ...
+    @property
+    def cleaner(self) -> IDataCleaner: ...
+    @property
+    def returns_processor(self) -> IReturnsProcessor: ...
+    @property
+    def weekly_processor(self) -> IReturnsProcessor: ...
+    @property
+    def threshold_strategy(self) -> IThresholdStrategy: ...
+    @property
+    def pair_generator(self) -> IPairGenerator: ...
+    @property
+    def lr_strategy(self) -> ILRStrategy: ...
+    @property
+    def gradient_clipper(self) -> IGradientClipper: ...
+    @property
+    def early_stopper(self) -> IEarlyStopper: ...
+    @property
+    def observers(self) -> list[ITrainingObserver]: ...
+    @property
+    def persistence(self) -> IModelPersistence: ...
+    @property
+    def similarity_metric(self) -> ISimilarityMetric: ...
+    @property
+    def clusterer(self) -> IClusteringStrategy: ...
+    @property
+    def oov_factory(self) -> OOVStrategyFactory: ...
+    @property
+    def anchor_profiler(self) -> IAnchorProfiler: ...
+    @property
+    def stock_profiler(self) -> IStockProfiler: ...
+    @property
+    def comparator(self) -> IStockComparator: ...
+    @property
+    def portfolio_analyser(self) -> IPortfolioAnalyser: ...
+    @property
+    def searcher(self) -> ISimilaritySearcher: ...
+    @property
+    def cross_market_searcher(self) -> ICrossMarketSearcher: ...
+    @property
+    def formatter(self) -> ResultFormatter: ...
+
+    def make_trainer(self,
+                     model: IEmbeddingModel) -> Trainer:
+      """Create Trainer with all injected dependencies."""
+      return Trainer(
+        model=model,
+        lr_strategy=self._lr_strategy,
+        gradient_clipper=self._clipper,
+        early_stopper=self._stopper,
+        observers=self._observers,
+        persistence=self._persistence,
+      )
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 9 — DATA PIPELINE SPECIFICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DATA SOURCE: yfinance only. No paid sources.
+
+DOWNLOAD:
+  batch size:           100 tickers per yfinance call
+  retry attempts:       3
+  retry wait:           5 seconds between attempts
+  rate limit:           1 second pause between batches
+  cache format:         parquet
+  cache location:       data/raw/{market}/prices.parquet
+  incremental:          fetch only since get_last_date() result
+  download_meta.json:
+    last_downloaded_date ticker_count failed_tickers
+    anomalies_detected
+  on failure:           log ticker continue never crash
+
+CLEANING:
+  forward fill:         maximum 5 consecutive missing days
+  drop ticker if:       fewer than 80 percent trading days have data
+                        average price below 1.00
+                        entire series is NaN
+  anomaly detection:    single day absolute return > 25 percent
+                        log to data/quality/anomaly_log.csv
+                        do not remove — user decides via dashboard
+
+RETURNS:
+  daily:                np.log(prices / prices.shift(1)).dropna()
+  weekly global only:   prices.resample("W-FRI").last() then log
+
+THRESHOLD:
+  formula:              threshold_multiplier * mean(std per stock)
+  recomputed each run   stored in metadata.json
+
+PAIR GENERATION:
+  up bucket:            return > threshold
+  down bucket:          return < negative threshold
+  bidirectional:        (A,B) and (B,A) both added
+  cap:                  max_pairs_per_day random sample if exceeded
+  output:               list of (center_idx, target_idx) int tuples
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 10 — TRAINING ENGINE SPECIFICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+THREE TRAINING MODES:
+
+  full retrain:
+    random initialisation full date range
+    refresh dynamic universe from Wikipedia
+    triggers S3 backup after validation passes
+
+  incremental update:
+    load existing weights continue training
+    new data only since last_trained_date
+    no vocab changes
+
+  fine-tune recent window:
+    load existing weights finetune_window_days of data
+    lr multiplied by finetune_lr_multiplier
+    no vocab changes
+
+TRAINING LOOP REQUIREMENTS:
+  shuffle pairs each epoch
+  compute loss for monitoring log to CSV do not use in update
+  update training_status.json after every epoch
+  checkpoint W1 every checkpoint_every_epochs
+  checkpoint filename W1_epoch_{n:04d}.npy
+  early stop if loss increases for early_stop_patience epochs
+  gradient clipping applied before every weight update
+
+TRAINING STATUS FILE:
+  data/models/{market}/training_status.json
+  status field: idle running complete failed
+  updated every epoch during training
+  full schema defined in Section 16
+
+MODEL VERSIONING:
+  directory: data/models/{market}/v{n}_{YYYYMMDD}_{mode}/
+  W1.npy as float32 vocab.json metadata.json
+  loss_history.csv validation.json checkpoints/
+  current/ updated ONLY after validation passes
+  reload_signal.json written after current/ updated
+
+TRAINING ORDER:
+  US then NZX then ASX then Global always
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 11 — HYPERPARAMETERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All in config/hyperparams.yaml nothing hardcoded in src/.
+
+  embed_dim:                  32
+  epochs:                     300
+  lr:                         auto
+  lr_scan_values:             [0.1, 0.01, 0.001, 0.0001]
+  lr_scan_epochs:             50
+  max_pairs_per_day:          10000
+  gradient_clip:              1.0
+  threshold_multiplier:       0.5
+  training_start:             "2019-01-01"
+  validation_year:            "2019"
+  random_seed:                42
+  finetune_window_days:       90
+  finetune_lr_multiplier:     0.1
+  checkpoint_every_epochs:    50
+  early_stop_patience:        20
+  min_history_pct:            0.80
+  min_price:                  1.00
+  download_batch_size:        100
+  download_retry_count:       3
+  download_retry_wait_secs:   5
+  download_rate_limit_secs:   1
+  oov_high_confidence_days:   60
+  oov_medium_confidence_days: 20
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 12 — VALIDATION SUITE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Runs automatically after every training run.
+Blocks current/ pointer update if any check FAILS.
+SKIP when either ticker not in vocab for this model.
+
+Individual check classes in src/validation/checks.py:
+
+  SimilarPairCheck(IValidationCheck)
+    passes if cosine_sim(a, b) >= min_similarity
+  DissimilarPairCheck(IValidationCheck)
+    passes if cosine_sim(a, b) <= max_similarity
+  SectorClusterCheck(IValidationCheck)
+    passes if each stock in list is closest to
+    specified anchor ETF among all sector ETFs
+
+Checks from config/validation.yaml:
+
+  similar pairs:
+    NVDA AMD   min 0.80  semiconductors
+    GLD  SLV   min 0.75  precious metals
+    XLE  USO   min 0.75  energy and oil
+    TLT  SHY   min 0.70  treasury bonds
+    AAPL MSFT  min 0.85  mega cap tech
+
+  dissimilar pairs:
+    GLD  ARKK  max 0.50  safe haven vs speculation
+    TLT  TSLA  max 0.50  bonds vs high beta
+    XLP  QQQ   max 0.60  staples vs tech
+
+  sector cluster checks:
+    [AAPL MSFT GOOGL] closest sector ETF should be XLK
+    [XOM CVX] closest sector ETF should be XLE
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 13 — QUERY ENGINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+QUERY ROUTING:
+  single market queries     per-market model
+  cross-market queries      global model
+  anchor profiles           US or global model
+  portfolio analysis        always global model
+
+QUERY TYPES:
+
+  stock_profile(ticker, model_data)
+    in vocab: use W1[ticker] directly
+    not in vocab: WeightedAverageOOV.estimate()
+    returns ProfileResult dataclass
+
+  stock_comparison(ticker_a, ticker_b, model_data)
+    profiles both independently
+    returns ComparisonResult dataclass
+
+  portfolio_analysis(tickers, global_model_data)
+    always global model
+    returns PortfolioResult dataclass
+    diversification_score: mean(1 - sim) * 100
+
+  find_similar(ticker, model_data, market_filter, min_sim)
+    optional filter by market
+    returns list[SearchResult]
+
+  cross_market_equivalent(source, target_market, global)
+    always global model
+    returns list[SearchResult] top 10
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 14 — DASHBOARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FRAMEWORK: Dash with Dash Bootstrap Components
+CHARTS: Plotly Express and Plotly Graph Objects
+HOST: settings.is_production -> 0.0.0.0 else 127.0.0.1
+PORT: settings.PORT
+
+MODEL STORE:
+  dashboard/state/model_store.py ModelStore singleton
+  load_all_models() at startup reads all four current/
+  pre-computes similarity matrices cluster assignments
+  anchor profiles for US and Global models
+  polls reload_signal.json every 30 seconds
+  reloads model silently when new signal detected
+  no restart required
+
+GLOBAL CONTROLS on every page:
+  model selector dropdown US NZX ASX Global
+  persists via dcc.Store across navigation
+
+PAGE 1 — Model overview
+  1a. similarity heatmap V by V with filters
+      hover exact score both tickers
+      click navigates to comparison page
+  1b. 2D PCA scatter colour by cluster
+      hover ticker cluster top 3 similar
+      click triggers stock_profile panel
+  1c. cluster explorer threshold slider 0.50 to 0.99
+      cluster list updates on slide
+      click cluster highlights on scatter
+
+PAGE 2 — Stock query
+  ticker text input any ticker in-vocab or OOV
+  2a. status badge green IN VOCAB amber OOV ESTIMATED
+      if amber show confidence days top 5 comovers
+  2b. anchor profile sector bar chart hidden for NZX
+  2c. anchor profile factor bar chart hidden for NZX
+  2d. anchor profile macro bar chart hidden for NZX
+  2e. top 10 similar horizontal bar chart
+      bars coloured by market US NZX ASX
+      click bar runs stock_profile for that ticker
+
+PAGE 3 — Stock comparison
+  two ticker inputs
+  3a. similarity score large colour coded
+      green >= 0.90 amber 0.70-0.89 red < 0.70
+  3b. side by side anchor profiles hidden for NZX
+  3c. shared nearest neighbours list
+  3d. anchor divergence sorted desc hidden for NZX
+
+PAGE 4 — Portfolio analysis
+  always global model
+  loaded from config/portfolio.yaml
+  session-only add/remove does not persist
+  4a. portfolio similarity matrix heatmap
+  4b. concentration risk panel
+      > 0.85 red 0.70-0.85 amber with descriptions
+  4c. cross-market sub-matrices
+      NZX vs NZX ASX vs ASX US vs US
+      combined all markets matrix below
+  4d. diversification score 0-100
+      green > 70 amber 40-69 red < 40
+
+PAGE 5 — Training control
+  5a. model status cards one per market
+  5b. loss curves multi-line chart
+  5c. training controls
+      mode selector date picker window selector
+      market checkboxes train button
+      progress bar polls training_status.json every 5s
+      button disabled during active training
+  5d. universe and data quality table
+      expandable failed tickers expandable anomaly log
+
+PAGE 6 — Cross-market query always global model
+  6a. single stock cross-market search
+      ticker input target market selector
+      top 10 results ranked
+  6b. portfolio cross-market equivalents table
+      NZX and ASX holdings mapped to US equivalents
+      US holdings mapped to NZX and ASX equivalents
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 15 — PORTFOLIO CONFIG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+config/portfolio.yaml dashboard use only not a training input
+
+nzx:
+  IFT.NZ: "Infratil"            ATM.NZ: "A2 Milk"
+  FPH.NZ: "Fisher Paykel"       MEL.NZ: "Meridian Energy"
+  CEN.NZ: "Contact Energy"      SPK.NZ: "Spark NZ"
+
+asx:
+  WDS.AX: "Woodside Energy"     STO.AX: "Santos"
+  PDN.AX: "Paladin Energy"      BOE.AX: "Boss Energy"
+  DYL.AX: "Deep Yellow"         WOR.AX: "Worley"
+
+us:
+  VST:   "Vistra Energy"        CCJ:   "Cameco"
+  LNG:   "Cheniere Energy"      AAPL:  "Apple"
+  MSFT:  "Microsoft"            GOOGL: "Alphabet"
+  NVDA:  "NVIDIA"               META:  "Meta"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 16 — SYSTEM ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TWO ENVIRONMENTS:
+
+  Local development:
+    developer laptop
+    host 127.0.0.1 port 8050
+    STOCK2VEC_ENV=development
+    S3_BACKUP_BUCKET empty string skips backup silently
+    small scale training for validation
+    git commits and pushes to GitHub
+
+  AWS EC2 production:
+    all full training runs
+    dashboard accessible from anywhere
+    STOCK2VEC_ENV=production
+    host 0.0.0.0 nginx proxies to 8050
+
+AWS SERVICES:
+
+  EC2 t3.medium 2 vCPU 4GB RAM Ubuntu 22.04 LTS
+    region ap-southeast-2 Sydney
+    running continuously approximately $15 per month
+
+  EBS gp3 50GB attached to EC2
+    all application data persists here
+    approximately $4 per month
+
+  Elastic IP fixed public address
+    free when attached to running instance
+
+  S3 bucket stock2vec-backups
+    model weight backups after each training run
+    IAM instance profile with S3 read write list only
+    never hardcode AWS credentials
+    approximately $0.50 per month
+
+  Security group:
+    port 22 SSH your IP only
+    port 443 HTTPS 0.0.0.0/0
+    port 80 HTTP 0.0.0.0/0 redirects to 443
+    outbound all allowed for yfinance downloads
+
+PROCESSES ON EC2:
+
+  nginx: system service always running
+    reverse proxy 443 to 127.0.0.1:8050
+    basic auth via htpasswd
+    proxy_read_timeout 300s
+
+  stock2vec-dashboard: systemd service always running
+    restarts automatically on failure
+    loads all four models on startup
+    polls training_status.json every 5 seconds
+    polls reload_signal.json every 30 seconds
+
+  training process: spawned as detached subprocess
+    progress written to training_status.json
+    dashboard polls and shows progress
+    reload signal written on completion
+    dashboard reloads weights automatically
+
+DATA FLOW:
+
+  yfinance -> IncrementalDownloader -> ParquetCache
+    -> StandardCleaner -> LogReturnsProcessor
+    -> VolatilityThresholdStrategy -> CoMovementPairGenerator
+    -> Word2VecModel via Trainer with observers
+    -> ModelVersioning -> current/ pointer
+    -> reload_signal.json -> ModelStore reload
+    -> ModelBackup -> S3
+
+SETTINGS:
+
+  config/settings.py reads environment variables
+  STOCK2VEC_ENV development or production
+  STOCK2VEC_DATA_DIR default data/
+  STOCK2VEC_LOG_LEVEL default DEBUG
+  STOCK2VEC_PORT default 8050
+  AWS_REGION default ap-southeast-2
+  S3_BACKUP_BUCKET default empty string
+
+  settings = Settings() module level singleton
+  all src/ files import from config.settings
+  zero hardcoded paths anywhere in src/
+
+TRAINING STATUS JSON SCHEMA:
+  {
+    status: idle/running/complete/failed,
+    mode: full/incremental/finetune,
+    current_model: int,
+    total_models: 4,
+    current_epoch: int,
+    total_epochs: int,
+    current_loss: float,
+    best_loss: float,
+    pairs_per_epoch: int,
+    started_at: ISO8601 string,
+    estimated_completion: ISO8601 string,
+    lr_selected: float,
+    universe_size: int,
+    threshold: float,
+    last_updated: ISO8601 string,
+    error: null or string
+  }
+
+RELOAD SIGNAL JSON SCHEMA:
+  {
+    timestamp: ISO8601 string,
+    new_version: string
+  }
+
+GIT STRATEGY:
+  track: config/ src/ dashboard/ tests/ deploy/
+         requirements.txt README.md .env.example .gitignore
+  ignore: data/ .env venv/ __pycache__/ *.pyc .DS_Store
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 17 — DEPLOY DIRECTORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+deploy/setup_ec2.sh
+  set -e bash script for fresh Ubuntu 22.04
+  installs python3.10 python3-pip python3-venv nginx
+  certbot python3-certbot-nginx git tmux awscli cron
+  clones repo creates venv installs requirements
+  creates all data directory structure
+  installs enables starts systemd service
+  configures nginx creates htpasswd for basic auth
+  prints access URL at completion
+
+deploy/stock2vec-dashboard.service
+  User=ubuntu
+  WorkingDirectory=/home/ubuntu/stock2vec
+  ExecStart full path to venv python dashboard/app.py
+  Restart=always RestartSec=10
+  StandardOutput=journal StandardError=journal
+
+deploy/nginx.conf
+  port 80 redirects to 443
+  port 443 ssl basic auth proxy_pass to 8050
+  proxy_http_version 1.1 Upgrade Connection headers
+  proxy_read_timeout 300s
+
+deploy/backup_cron.sh
+  aws s3 sync data/models/ s3://stock2vec-backups/models/
+  daily at 3am UTC as redundant backup
+  logs to data/logs/backup.log
+
+deploy/README_deploy.md
+  launch EC2 attach EBS allocate Elastic IP
+  configure security group run setup_ec2.sh
+  set environment variables in systemd service override
+  set up SSL certbot or self-signed
+  verify dashboard access
+  update code section: git pull pip install restart service
+  restore from S3 section
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 18 — PROJECT STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+stock2vec/
+    config/
+        universe.yaml
+        hyperparams.yaml
+        portfolio.yaml
+        validation.yaml
+        settings.py
+        container.py
+    data/
+        raw/
+            us/      nzx/      asx/      global/
+        processed/
+            us/      nzx/      asx/      global/
+        models/
+            us/current/   nzx/current/
+            asx/current/  global/current/
+        quality/
+            anomaly_log.csv
+        logs/
+    src/
+        interfaces/
+            __init__.py
+            data.py
+            model.py
+            embeddings.py
+            queries.py
+        models/
+            __init__.py
+            results.py
+        pipeline/
+            __init__.py
+            sources.py
+            cache.py
+            downloader.py
+            cleaner.py
+            returns.py
+            threshold.py
+            pairs.py
+            status.py
+        training/
+            __init__.py
+            word2vec.py
+            observers.py
+            lr_strategy.py
+            clipping.py
+            stopping.py
+            trainer.py
+            versioning.py
+            scheduler.py
+            process.py
+            backup.py
+        embeddings/
+            __init__.py
+            metrics.py
+            clustering.py
+            anchors.py
+            oov/
+                __init__.py
+                base.py
+                weighted.py
+                factory.py
+        queries/
+            __init__.py
+            profiler.py
+            comparator.py
+            portfolio.py
+            search.py
+            cross_market.py
+            formatter.py
+        validation/
+            __init__.py
+            suite.py
+            reporter.py
+            checks.py
+        universe/
+            __init__.py
+            universe.py
+            scrapers.py
+    dashboard/
+        app.py
+        state/
+            __init__.py
+            model_store.py
+        pages/
+            __init__.py
+            model_overview.py
+            stock_query.py
+            stock_comparison.py
+            portfolio_view.py
+            training_panel.py
+            cross_market.py
+        components/
+            __init__.py
+            charts.py
+            tables.py
+            badges.py
+    tests/
+        __init__.py
+        unit/
+            __init__.py
+            test_sources.py
+            test_cache.py
+            test_cleaner.py
+            test_returns.py
+            test_pairs.py
+            test_word2vec.py
+            test_observers.py
+            test_metrics.py
+            test_clustering.py
+            test_oov.py
+            test_profiler.py
+            test_queries.py
+            test_validation.py
+        integration/
+            __init__.py
+            test_pipeline.py
+            test_training.py
+            test_dashboard.py
+        fixtures/
+            __init__.py
+            mock_sources.py
+            mock_cache.py
+            sample_data.py
+    deploy/
+        setup_ec2.sh
+        stock2vec-dashboard.service
+        nginx.conf
+        backup_cron.sh
+        README_deploy.md
+    train.py
+    requirements.txt
+    .env.example
+    .gitignore
+    README.md
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 19 — REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+numpy>=1.24.0
+pandas>=2.0.0
+yfinance>=0.2.28
+plotly>=5.15.0
+dash>=2.11.0
+dash-bootstrap-components>=1.4.0
+pyarrow>=12.0.0
+scikit-learn>=1.3.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+pytest>=7.4.0
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+lxml>=4.9.0
+boto3>=1.26.0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 20 — CODE QUALITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Apply to every file in every task without exception.
+
+  type hints:       every function signature
+  docstrings:       every class every public method
+                    interface methods state contract
+                    preconditions and postconditions
+  logging:          Python logging module only
+                    zero print() in src/
+  config driven:    zero hardcoded values in src/
+                    all from config/ via settings
+  error handling:   yfinance failures caught logged retried
+                    never crash on single ticker failure
+  no globals:       no module-level mutable state
+  imports:          standard library then third party
+                    then local alphabetical within groups
+  no isinstance:    never check concrete type in business logic
+  constructor DI:   no class instantiates its own dependencies
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 21 — BUILD ORDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Task 1 — project scaffolding
+  complete directory structure all __init__.py files
+  requirements.txt from Section 19
+  config/settings.py Settings class from env vars
+    settings = Settings() module level singleton
+  .env.example all variable names with descriptions
+  .gitignore entries from Section 16
+  train.py stub with argument parsing
+    --market accepts us nzx asx global all
+    --mode accepts full incremental finetune
+    main(args) logs received arguments
+  do not create any other files in Task 1
+
+Task 2 — interfaces and result types
+  src/interfaces/data.py all data interfaces
+  src/interfaces/model.py all model interfaces
+  src/interfaces/embeddings.py all embedding interfaces
+  src/interfaces/queries.py all query interfaces
+  src/models/results.py all dataclasses
+    SimilarStock AnchorProfile OOVMetadata
+    ProfileResult ComparisonResult PortfolioResult
+    SearchResult ClusterResult ModelData
+  config/container.py ServiceContainer stub
+    all properties defined as NotImplemented stubs
+    full wiring added in later task after implementations exist
+  no implementation files in Task 2 only interfaces and types
+
+Task 3 — config files
+  config/universe.yaml full universe from Section 4
+  config/hyperparams.yaml all values from Section 11
+  config/portfolio.yaml full portfolio from Section 15
+  config/validation.yaml all checks from Section 12
+
+Task 4 — universe management
+  src/universe/scrapers.py
+    WikipediaScraper scrapes S&P500 NASDAQ100 ASX300
+    hardcoded NZX list loader
+  src/universe/universe.py
+    UniverseManager
+    get_full_universe(market) returns merged ticker list
+    get_anchor_tickers(market) returns anchors or empty for NZX
+    all data from config/universe.yaml via settings
+
+Task 5 — data pipeline
+  src/pipeline/sources.py YFinancePriceSource(IPriceSource)
+  src/pipeline/cache.py ParquetCache(ICache)
+  src/pipeline/downloader.py IncrementalDownloader
+    depends on IPriceSource and ICache via constructor
+  src/pipeline/cleaner.py StandardCleaner(IDataCleaner)
+  src/pipeline/returns.py
+    LogReturnsProcessor(IReturnsProcessor)
+    WeeklyResampleProcessor(IReturnsProcessor) decorator
+  src/pipeline/threshold.py
+    VolatilityThresholdStrategy(IThresholdStrategy)
+    FixedThresholdStrategy(IThresholdStrategy)
+  src/pipeline/pairs.py CoMovementPairGenerator(IPairGenerator)
+  src/pipeline/status.py TrainingStatus
+  tests/unit/test_sources.py uses MockPriceSource
+  tests/unit/test_cache.py uses MockCache
+  tests/unit/test_cleaner.py
+  tests/unit/test_returns.py
+  tests/unit/test_pairs.py verify bidirectionality and cap
+  tests/fixtures/mock_sources.py MockPriceSource(IPriceSource)
+  tests/fixtures/mock_cache.py MockCache(ICache)
+  tests/fixtures/sample_data.py small price DataFrames
+
+Task 6 — training engine
+  src/training/word2vec.py Word2VecModel(IEmbeddingModel)
+    CRITICAL: backward() uses dscores[target_idx] -= 1
+    loss NOT computed here loss computed in Trainer only
+  src/training/observers.py all four observer classes
+  src/training/lr_strategy.py ScanLRStrategy FixedLRStrategy
+  src/training/clipping.py GradientClipper
+  src/training/stopping.py PatienceEarlyStopper
+  src/training/trainer.py Trainer depends on interfaces only
+  tests/unit/test_word2vec.py
+    EXPLICITLY verify dscores[target_idx] -= 1 not = -1
+    EXPLICITLY verify loss not used in update
+    verify loss falls over epochs on sample data
+    verify gradient clipping applied
+  tests/unit/test_observers.py using mocks
+
+Task 7 — model versioning and process management
+  src/training/versioning.py ModelVersioning
+    update_current() only called after validation passes
+    writes reload_signal.json
+  src/training/scheduler.py TrainingScheduler
+    run_all() enforces Global trains last
+  src/training/process.py TrainingProcess spawns subprocess
+  src/training/backup.py ModelBackup skips if S3 bucket empty
+
+Task 8 — embeddings
+  src/embeddings/metrics.py CosineMetric(ISimilarityMetric)
+  src/embeddings/clustering.py
+    GreedyClusterer(IClusteringStrategy)
+    KMeansClusterer(IClusteringStrategy)
+  src/embeddings/oov/weighted.py WeightedAverageOOV(IOOVStrategy)
+  src/embeddings/oov/factory.py OOVStrategyFactory
+  src/embeddings/anchors.py EtfAnchorProfiler(IAnchorProfiler)
+    returns empty dict when anchor_tickers is empty list
+  tests/unit/test_metrics.py cosine bounds symmetry
+  tests/unit/test_clustering.py threshold behaviour
+  tests/unit/test_oov.py unit vector output None when no data
+  anchor profile returns empty dict for empty anchor list
+
+Task 9 — validation suite
+  src/validation/checks.py
+    IValidationCheck(ABC)
+    SimilarPairCheck(IValidationCheck)
+    DissimilarPairCheck(IValidationCheck)
+    SectorClusterCheck(IValidationCheck)
+  src/validation/suite.py ValidationSuite
+    loads checks from config/validation.yaml
+    runs all checks marks PASS FAIL SKIP
+  src/validation/reporter.py ValidationReporter
+  tests/unit/test_validation.py
+    verify SKIP when ticker missing
+    verify current not updated on FAIL
+
+Task 10 — query engine and container wiring
+  src/queries/profiler.py EmbeddingStockProfiler
+  src/queries/comparator.py EmbeddingComparator
+  src/queries/portfolio.py PortfolioAnalyser always global
+  src/queries/search.py CosineSimilaritySearcher
+  src/queries/cross_market.py GlobalModelCrossMarketSearcher
+  src/queries/formatter.py ResultFormatter dataclass to dict
+  config/container.py complete wiring of all implementations
+  tests/unit/test_profiler.py using mock ModelData
+  tests/unit/test_queries.py all five query types
+    verify cross-market routes to global model
+    verify portfolio routes to global model
+
+Task 11 — dashboard foundation and model store
+  dashboard/state/model_store.py ModelStore singleton
+    load_all_models() pre-computes matrices and profiles
+    poll_reload_signals() every 30 seconds
+    reload_model() silent hot reload
+  dashboard/app.py
+    ServiceContainer instantiation
+    dcc.Store for model selection
+    navigation layout
+    host from settings.is_production
+  dashboard/components/charts.py reusable chart functions
+  dashboard/components/tables.py reusable table functions
+  dashboard/components/badges.py in-vocab OOV badges
+
+Task 12 — dashboard pages 1 and 2
+  dashboard/pages/model_overview.py
+    similarity heatmap with filter controls
+    2D PCA scatter with click interaction using sklearn PCA only
+    cluster explorer threshold slider
+  dashboard/pages/stock_query.py
+    ticker input badge anchor profiles top 10
+    anchor charts hidden when NZX model selected
+
+Task 13 — dashboard pages 3 and 4
+  dashboard/pages/stock_comparison.py
+    two inputs similarity score side by side profiles
+    shared neighbours anchor divergence
+    profiles hidden when NZX selected
+  dashboard/pages/portfolio_view.py
+    always global model
+    heatmap concentration risk cross-market matrices
+    diversification score
+
+Task 14 — dashboard pages 5 and 6
+  dashboard/pages/training_panel.py
+    status cards loss curves controls
+    progress polling training_status.json every 5s
+    data quality expandable sections
+  dashboard/pages/cross_market.py
+    single stock search portfolio equivalents table
+
+Task 15 — deploy directory
+  deploy/setup_ec2.sh full bash script
+  deploy/stock2vec-dashboard.service systemd unit
+  deploy/nginx.conf reverse proxy with auth
+  deploy/backup_cron.sh S3 sync
+  deploy/README_deploy.md step by step instructions
+
+Task 16 — integration tests
+  tests/integration/test_pipeline.py
+    IncrementalDownloader -> StandardCleaner
+    -> LogReturnsProcessor -> CoMovementPairGenerator
+    using MockPriceSource and MockCache
+    end to end on sample_data fixtures
+  tests/integration/test_training.py
+    pairs -> Word2VecModel via Trainer -> ValidationSuite
+    verify loss falls verify validation runs
+    verify reload signal written
+  tests/integration/test_dashboard.py
+    ModelStore loads mock model data
+    all query types return expected dataclass types
+
+Task 17 — train.py complete and README
+  train.py full implementation
+    parse --market --mode --start --end
+    instantiate ServiceContainer
+    call pipeline then trainer then validation then backup
+    log all steps to logging module
+  README.md
+    project overview
+    local development setup and running
+    AWS deployment pointer to deploy/README_deploy.md
+    adding stocks to portfolio config
+    running tests
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONSTRAINTS — ENFORCED IN EVERY TASK WITHOUT EXCEPTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1.  dscores[target_idx] -= 1
+    NEVER = -1
+    silent divergence most critical line in codebase
+
+2.  No PyTorch TensorFlow Keras or deep learning frameworks
+    numpy training loop non-negotiable
+
+3.  Zero hardcoded values in src/
+    everything from config/ via settings
+
+4.  Python logging module only zero print() in src/
+
+5.  Type hints every function docstrings every class method
+
+6.  yfinance failures caught logged retried never crash
+
+7.  NZX has no anchors
+    EtfAnchorProfiler returns empty dict for NZX
+    dashboard hides all anchor sections for NZX
+
+8.  US Tier A ETFs only in US model and Global model
+
+9.  Global model always trains last
+
+10. Weekly returns global model only
+    prices.resample("W-FRI").last() then log returns
+
+11. Loss never appears in W1 or W2 update lines
+
+12. Backup skips silently if S3_BACKUP_BUCKET empty
+
+13. host from settings never hardcoded in app.py
+
+14. current/ updated only after validation passes
+
+15. No class instantiates its own dependencies
+    constructor injection throughout
+
+16. No isinstance checks in business logic
+
+17. All interfaces in src/interfaces/ using ABC abstractmethod
+
+18. All result types as dataclasses in src/models/results.py
+
+19. All concrete wiring in config/container.py only
+
+20. Unit tests use mocks via constructor never touch disk or network
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIRST TASK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Execute Task 1 only.
+
+Create the complete directory structure with all __init__.py files.
+Create requirements.txt from Section 19.
+Create config/settings.py with Settings class and singleton.
+Create .env.example with all variable names and descriptions.
+Create .gitignore with entries from Section 16.
+Create train.py stub with argument parsing and main(args) stub.
+
+Do not create any config yaml files in Task 1.
+Do not create any src/ implementation files in Task 1.
+Only the files listed above plus directory structure.
+
+After completing Task 1:
+  list every file and directory created
+  flag anything you could not create and why
+  do not begin Task 2
+  wait for my confirmation to proceed

@@ -1,0 +1,45 @@
+# Stock2Vec Hyperparameters
+# All values referenced via config.settings — nothing hardcoded in src/
+
+# Training
+embed_dim: 32
+epochs: 200
+lr: 0.01
+lr_scan_values: [0.1, 0.01, 0.001, 0.0001]
+lr_scan_epochs: 50
+max_pairs_per_day: 10000
+gradient_clip: 999.0
+threshold_multiplier: 2.5
+training_start: "2019-01-01"
+validation_year: "2019"
+random_seed: 42
+finetune_window_days: 90
+finetune_lr_multiplier: 0.1
+checkpoint_every_epochs: 50
+early_stop_patience: 20
+
+# Model mode: "softmax" or "negative_sampling"
+model_mode: negative_sampling
+num_negatives: 5
+
+# Returns mode: "log" or "market_neutral"
+returns_mode: market_neutral
+benchmark_ticker: SPY
+
+# Pair generation mode: "comovement" or "correlation"
+pair_mode: correlation
+correlation_window_days: 30
+correlation_min: 0.85
+correlation_step_days: 5
+
+# Data pipeline
+min_history_pct: 0.80
+min_price: 1.00
+download_batch_size: 100
+download_retry_count: 3
+download_retry_wait_secs: 5
+download_rate_limit_secs: 1
+
+# OOV estimation
+oov_high_confidence_days: 60
+oov_medium_confidence_days: 20

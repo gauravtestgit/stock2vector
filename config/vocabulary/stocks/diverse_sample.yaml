@@ -1,0 +1,24 @@
+scraped_at: "2026-05-11T00:00:00+00:00"
+source: "manual - diverse sectors"
+count: 15
+tickers:
+  # Tech/Semiconductors
+  - NVDA
+  - AMD
+  - AVGO
+  # Energy
+  - XOM
+  - CVX
+  - COP
+  # Healthcare/Pharma
+  - JNJ
+  - PFE
+  - MRK
+  # Consumer Staples
+  - KO
+  - PG
+  - WMT
+  # Financials
+  - JPM
+  - GS
+  - BAC

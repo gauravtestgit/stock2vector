@@ -1,0 +1,29 @@
+# Stock2Vec Portfolio Configuration
+# Dashboard use only — not a training input
+# Session-only add/remove does not persist
+
+nzx:
+  IFT.NZ: "Infratil"
+  ATM.NZ: "A2 Milk"
+  FPH.NZ: "Fisher Paykel"
+  MEL.NZ: "Meridian Energy"
+  CEN.NZ: "Contact Energy"
+  SPK.NZ: "Spark NZ"
+
+asx:
+  WDS.AX: "Woodside Energy"
+  STO.AX: "Santos"
+  PDN.AX: "Paladin Energy"
+  BOE.AX: "Boss Energy"
+  DYL.AX: "Deep Yellow"
+  WOR.AX: "Worley"
+
+us:
+  VST: "Vistra Energy"
+  CCJ: "Cameco"
+  LNG: "Cheniere Energy"
+  AAPL: "Apple"
+  MSFT: "Microsoft"
+  GOOGL: "Alphabet"
+  NVDA: "NVIDIA"
+  META: "Meta"

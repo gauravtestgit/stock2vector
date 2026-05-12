@@ -1,0 +1,137 @@
+# Stock2Vec Universe Definition
+# Defines all anchor ETFs, hardcoded stock lists, and dynamic scrape sources
+
+us_tier_a_anchors:
+  market_etfs:
+    SPY: "S&P 500"
+    QQQ: "NASDAQ 100"
+    IWM: "Russell 2000"
+    DIA: "Dow Jones"
+    VTI: "Total market"
+
+  sector_etfs:
+    XLK: "Technology"
+    XLF: "Financials"
+    XLE: "Energy"
+    XLV: "Healthcare"
+    XLI: "Industrials"
+    XLY: "Consumer discretionary"
+    XLP: "Consumer staples"
+    XLU: "Utilities"
+    XLB: "Materials"
+    XLRE: "Real estate"
+    XLC: "Communication services"
+
+  factor_etfs:
+    VUG: "Growth"
+    VTV: "Value"
+    MTUM: "Momentum"
+    USMV: "Low volatility"
+    QUAL: "Quality"
+    VIG: "Dividend growth"
+    SCHA: "Small cap"
+
+  macro:
+    TLT: "20yr Treasury"
+    SHY: "2yr Treasury"
+    TIP: "TIPS inflation"
+    GLD: "Gold"
+    SLV: "Silver"
+    DBA: "Agriculture"
+    USO: "Oil"
+    UNG: "Natural gas"
+    UUP: "USD index"
+    HYG: "High yield credit"
+    LQD: "Investment grade credit"
+
+  thematic:
+    SOXX: "Semiconductors"
+    ITA: "Defense"
+    URA: "Uranium"
+    ICLN: "Clean energy"
+    ARKK: "Innovation"
+    ROBO: "Robotics AI"
+    HACK: "Cybersecurity"
+    FINX: "Fintech"
+    IBB: "Biotech"
+
+asx_anchors:
+  sector_etfs:
+    XMJ.AX: "ASX materials"
+    XEJ.AX: "ASX energy"
+    XFJ.AX: "ASX financials"
+    XHJ.AX: "ASX healthcare"
+    XNJ.AX: "ASX industrials"
+    XPJ.AX: "ASX property"
+    XTJ.AX: "ASX telco"
+    XUJ.AX: "ASX utilities"
+
+  commodities_and_fx:
+    GC=F: "Gold futures"
+    CL=F: "Crude oil futures"
+    HG=F: "Copper futures"
+    AUDUSD=X: "AUD/USD exchange rate"
+
+nzx_stocks:
+  - IFT.NZ
+  - ATM.NZ
+  - FPH.NZ
+  - MEL.NZ
+  - CEN.NZ
+  - MCY.NZ
+  - GNE.NZ
+  - SPK.NZ
+  - AIA.NZ
+  - EBO.NZ
+  - RYM.NZ
+  - SUM.NZ
+  - PCT.NZ
+  - ARG.NZ
+  - GMT.NZ
+  - PFI.NZ
+  - AFT.NZ
+  - VHP.NZ
+  - MHJ.NZ
+  - KMD.NZ
+  - HLG.NZ
+  - STU.NZ
+  - PPH.NZ
+  - THL.NZ
+  - WBC.NZ
+  - ANZ.NZ
+  - SCL.NZ
+  - SAN.NZ
+  - NZM.NZ
+  - CVT.NZ
+  - ALF.NZ
+  - NZK.NZ
+  - SKC.NZ
+  - TPW.NZ
+  - GTK.NZ
+  - IKE.NZ
+  - WIN.NZ
+  - NZR.NZ
+  - PEB.NZ
+  - RUA.NZ
+  - TRA.NZ
+  - BRM.NZ
+  - FWL.NZ
+  - MOV.NZ
+  - NWF.NZ
+  - OCA.NZ
+  - CMO.NZ
+  - SKT.NZ
+  - SML.NZ
+  - MFT.NZ
+
+dynamic_universe:
+  sp500:
+    url: "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    column: "Symbol"
+  nasdaq100:
+    url: "https://en.wikipedia.org/wiki/Nasdaq-100"
+    column: "Ticker"
+  asx300:
+    url: "https://en.wikipedia.org/wiki/S%26P/ASX_300"
+    column: "Code"
+    suffix: ".AX"

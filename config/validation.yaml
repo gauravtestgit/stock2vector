@@ -1,0 +1,39 @@
+# Stock2Vec Validation Suite
+# Runs after every training run. Blocks current/ update if any check FAILS.
+# SKIP when either ticker not in vocab for this model.
+
+similar_pairs:
+  - pair: [NVDA, AMD]
+    min_similarity: 0.80
+    description: "semiconductors"
+  - pair: [GLD, SLV]
+    min_similarity: 0.75
+    description: "precious metals"
+  - pair: [XLE, USO]
+    min_similarity: 0.75
+    description: "energy and oil"
+  - pair: [TLT, SHY]
+    min_similarity: 0.70
+    description: "treasury bonds"
+  - pair: [AAPL, MSFT]
+    min_similarity: 0.85
+    description: "mega cap tech"
+
+dissimilar_pairs:
+  - pair: [GLD, ARKK]
+    max_similarity: 0.50
+    description: "safe haven vs speculation"
+  - pair: [TLT, TSLA]
+    max_similarity: 0.50
+    description: "bonds vs high beta"
+  - pair: [XLP, QQQ]
+    max_similarity: 0.60
+    description: "staples vs tech"
+
+sector_cluster_checks:
+  - tickers: [AAPL, MSFT, GOOGL]
+    expected_sector_etf: XLK
+    description: "tech stocks closest to XLK"
+  - tickers: [XOM, CVX]
+    expected_sector_etf: XLE
+    description: "energy stocks closest to XLE"

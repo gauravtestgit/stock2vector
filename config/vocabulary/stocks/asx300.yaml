@@ -1,0 +1,34 @@
+scraped_at: "2025-04-10T00:00:00+00:00"
+source: "https://en.wikipedia.org/wiki/S%26P/ASX_300"
+count: 30
+tickers:
+  - ALL.AX
+  - ANZ.AX
+  - BHP.AX
+  - BXB.AX
+  - CBA.AX
+  - COL.AX
+  - CSL.AX
+  - FMG.AX
+  - GMG.AX
+  - IAG.AX
+  - JHX.AX
+  - MQG.AX
+  - NAB.AX
+  - NCM.AX
+  - ORG.AX
+  - QAN.AX
+  - QBE.AX
+  - REA.AX
+  - RIO.AX
+  - S32.AX
+  - SHL.AX
+  - STO.AX
+  - SUN.AX
+  - TCL.AX
+  - TLS.AX
+  - WBC.AX
+  - WDS.AX
+  - WES.AX
+  - WOW.AX
+  - XRO.AX
