@@ -1,5 +1,5 @@
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 from collections import Counter
 from src.implementations.pipeline.cache import ParquetCache

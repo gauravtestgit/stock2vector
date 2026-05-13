@@ -1,5 +1,5 @@
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.implementations.training.persistence import NumpyPersistence
 from src.implementations.embeddings.metrics import CosineMetric
 
