@@ -1,0 +1,12 @@
+# Run configuration template — copy to config/run.yaml and edit
+# CLI args override these values:
+#   python run_full_flow.py --run-name my_model --stock-file nasdaq_100.csv --start 2024-01-01 --end 2026-05-10
+
+run_name: my_model
+stock_files:
+  - nasdaq_100.csv
+anchor_groups:
+  - market_etfs
+  - sector_etfs
+start: "2024-04-01"
+end: "2026-05-10"

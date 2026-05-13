@@ -94,6 +94,7 @@ app.layout = html.Div([
         children=[
             dbc.NavItem(dbc.NavLink("Overview", href="/")),
             dbc.NavItem(dbc.NavLink("Query", href="/query")),
+            dbc.NavItem(dbc.NavLink("Train", href="/train")),
             dbc.NavItem(html.Div([
                 dcc.Dropdown(
                     id="model-selector",
@@ -144,6 +145,8 @@ def switch_model(model_path):
 def display_page(pathname, model_path):
     if pathname == "/query":
         return _build_query_layout()
+    if pathname == "/train":
+        return _build_train_layout()
     return _build_overview_layout()
 
 
@@ -390,6 +393,200 @@ def _estimate_oov(ticker):
                                  vocab_returns)
     except Exception:
         return None
+
+
+# ── Train Page ───────────────────────────────────────────────
+
+import subprocess
+import threading
+import json
+from src.universe.universe import UniverseManager
+
+_training_process = None
+
+
+def _get_stock_files():
+    """List available stock files."""
+    manager = UniverseManager()
+    return manager.list_stock_files()
+
+
+def _get_anchor_groups():
+    """List available anchor groups."""
+    manager = UniverseManager()
+    return manager.list_anchor_groups()
+
+
+def _build_train_layout():
+    stock_files = _get_stock_files()
+    anchor_groups = _get_anchor_groups()
+
+    return html.Div([
+        dbc.Row([
+            # Config panel
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H5("Training Configuration"),
+                dbc.Label("Run Name"),
+                dbc.Input(id="train-run-name", type="text", value="new_model",
+                          placeholder="e.g., nasdaq_100_v2"),
+                dbc.Label("Stock File", className="mt-2"),
+                dcc.Dropdown(
+                    id="train-stock-file",
+                    options=[{"label": f, "value": f} for f in stock_files],
+                    value=stock_files[0] if stock_files else None,
+                    style={"color": "#000"},
+                ),
+                dbc.Label("Anchor Groups", className="mt-2"),
+                dcc.Dropdown(
+                    id="train-anchor-groups",
+                    options=[{"label": g, "value": g} for g in anchor_groups],
+                    value=["market_etfs", "sector_etfs"],
+                    multi=True,
+                    style={"color": "#000"},
+                ),
+                dbc.Label("Date Range", className="mt-2"),
+                dbc.Row([
+                    dbc.Col(dbc.Input(id="train-start", type="text", value="2024-04-01",
+                                     placeholder="YYYY-MM-DD"), md=6),
+                    dbc.Col(dbc.Input(id="train-end", type="text", value="2026-05-10",
+                                     placeholder="YYYY-MM-DD"), md=6),
+                ]),
+                dbc.Label("Epochs", className="mt-2"),
+                dbc.Input(id="train-epochs", type="number", value=200),
+                dbc.Label("Learning Rate", className="mt-2"),
+                dbc.Input(id="train-lr", type="number", value=0.01, step=0.001),
+                dbc.Label("Min Correlation", className="mt-2"),
+                dbc.Input(id="train-min-corr", type="number", value=0.85, step=0.05),
+                html.Hr(),
+                dbc.Button("Start Training", id="train-start-btn", color="success",
+                           className="w-100", n_clicks=0),
+            ])), md=4),
+
+            # Progress panel
+            dbc.Col(html.Div([
+                dbc.Card(dbc.CardBody([
+                    html.H5("Training Progress"),
+                    html.Div(id="train-status"),
+                    dbc.Progress(id="train-progress", value=0, striped=True,
+                                 animated=True, className="mt-2"),
+                    html.Div(id="train-loss-info", className="mt-2"),
+                ])),
+                dcc.Graph(id="train-loss-chart", figure=go.Figure()),
+                dcc.Interval(id="train-poll", interval=2000, n_intervals=0),
+            ]), md=8),
+        ]),
+    ])
+
+
+@app.callback(
+    Output("train-status", "children"),
+    Output("train-progress", "value"),
+    Output("train-loss-info", "children"),
+    Output("train-loss-chart", "figure"),
+    Input("train-poll", "n_intervals"),
+    State("train-run-name", "value"),
+)
+def poll_training_progress(n_intervals, run_name):
+    if not run_name:
+        return "No training active.", 0, "", go.Figure()
+
+    status_path = os.path.join(settings.models_dir, run_name, "training_status.json")
+    loss_path = os.path.join(settings.models_dir, run_name, "loss_history.csv")
+
+    # Read status
+    status_text = "Waiting..."
+    progress = 0
+    loss_info = ""
+
+    if os.path.exists(status_path):
+        try:
+            with open(status_path) as f:
+                status = json.load(f)
+            state = status.get("status", "unknown")
+            epoch = status.get("current_epoch", 0)
+            total = status.get("total_epochs", 200)
+            loss = status.get("current_loss", 0)
+
+            if state == "running":
+                progress = int((epoch + 1) / total * 100)
+                status_text = dbc.Alert(
+                    f"Training... Epoch {epoch + 1}/{total}",
+                    color="info", className="py-1 mb-0")
+                loss_info = f"Current loss: {loss:.4f}"
+            elif state == "complete":
+                progress = 100
+                final = status.get("final_loss", 0)
+                status_text = dbc.Alert(
+                    f"Complete! Final loss: {final:.4f}",
+                    color="success", className="py-1 mb-0")
+            elif state == "failed":
+                status_text = dbc.Alert(
+                    f"Failed: {status.get('error', 'unknown')}",
+                    color="danger", className="py-1 mb-0")
+        except Exception:
+            pass
+
+    # Read loss curve
+    fig = go.Figure()
+    if os.path.exists(loss_path):
+        try:
+            loss_df = pd.read_csv(loss_path)
+            fig.add_trace(go.Scatter(
+                x=loss_df["epoch"], y=loss_df["avg_loss"],
+                mode="lines", line=dict(color="#2ecc71", width=2),
+            ))
+            fig.update_layout(
+                title="Training Loss (live)",
+                xaxis_title="Epoch", yaxis_title="Loss",
+                template="plotly_dark", height=350,
+            )
+        except Exception:
+            pass
+
+    return status_text, progress, loss_info, fig
+
+
+@app.callback(
+    Output("train-start-btn", "children"),
+    Input("train-start-btn", "n_clicks"),
+    State("train-run-name", "value"),
+    State("train-stock-file", "value"),
+    State("train-anchor-groups", "value"),
+    State("train-start", "value"),
+    State("train-end", "value"),
+    State("train-epochs", "value"),
+    State("train-lr", "value"),
+    State("train-min-corr", "value"),
+    prevent_initial_call=True,
+)
+def start_training(n_clicks, run_name, stock_file, anchor_groups, start_date,
+                   end_date, epochs, lr, min_corr):
+    global _training_process
+
+    if not run_name or not stock_file:
+        return "Start Training"
+
+    # Build the training command
+    train_script = os.path.join(os.path.dirname(__file__), "..", "train_from_dashboard.py")
+    cmd = [
+        sys.executable, train_script,
+        "--run-name", run_name,
+        "--stock-file", stock_file,
+        "--anchor-groups", ",".join(anchor_groups or []),
+        "--start", start_date,
+        "--end", end_date,
+        "--epochs", str(epochs),
+        "--lr", str(lr),
+        "--min-corr", str(min_corr),
+    ]
+
+    # Launch as subprocess
+    _training_process = subprocess.Popen(
+        cmd, cwd=os.path.join(os.path.dirname(__file__), ".."),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    return "Training Started..."
 
 
 if __name__ == "__main__":

@@ -5,11 +5,19 @@ Full end-to-end Stock2Vec flow using spec-compliant pipeline:
   → Trainer → NumpyPersistence → CosineMetric queries
 
 All parameters driven by config/settings.py and config/hyperparams.yaml.
+
+Usage:
+    python run_full_flow.py                                    # reads from config/run.yaml
+    python run_full_flow.py --run-name my_model --stock-file nasdaq_100.csv --start 2024-04-01 --end 2026-05-10
+    python run_full_flow.py --run-name my_model --stock-file nasdaq_100.csv --anchors market_etfs,sector_etfs
 """
 import sys
 import os
 import logging
+import argparse
 sys.path.insert(0, os.path.dirname(__file__))
+
+import yaml
 
 from config.settings import settings
 from src.universe.universe import UniverseManager
@@ -41,25 +49,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Config ───────────────────────────────────────────────────
-# Name for this run (used for cache key and model output directory)
-RUN_NAME = "nasdaq_100_12_may_4"
-# RUN_NAME = "sample_11_may_5"
 
-# Stock files to include (from config/vocabulary/stocks/)
-STOCK_FILES = ["nasdaq_100.csv"]
-# STOCK_FILES = ["sample.yaml"]
-ANCHOR_GROUPS = ["market_etfs", "sector_etfs"]
+def load_run_config(args):
+    """Load run config from CLI args, falling back to config/run.yaml."""
+    run_yaml_path = os.path.join(os.path.dirname(__file__), "config", "run.yaml")
 
-# Anchor groups to include (from config/universe.yaml), or empty list for none
-# Available: market_etfs, sector_etfs, factor_etfs, macro, thematic,
-#            commodities_and_fx (ASX)
+    # Defaults from run.yaml if it exists
+    defaults = {}
+    if os.path.exists(run_yaml_path):
+        with open(run_yaml_path) as f:
+            defaults = yaml.safe_load(f) or {}
 
-START = "2023-04-01"
-END = "2026-05-10"
+    # CLI overrides run.yaml
+    run_name = args.run_name or defaults.get("run_name", "default_run")
+    stock_files = ([args.stock_file] if args.stock_file
+                   else defaults.get("stock_files", ["nasdaq_100.csv"]))
+    anchor_groups = (args.anchors.split(",") if args.anchors
+                     else defaults.get("anchor_groups", ["market_etfs", "sector_etfs"]))
+    start = args.start or defaults.get("start", "2024-04-01")
+    end = args.end or defaults.get("end", "2026-05-10")
+
+    return run_name, stock_files, anchor_groups, start, end
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Run full Stock2Vec training pipeline")
+    parser.add_argument("--run-name", help="Name for this run")
+    parser.add_argument("--stock-file", help="Stock file (e.g., nasdaq_100.csv)")
+    parser.add_argument("--anchors", help="Comma-separated anchor groups (e.g., market_etfs,sector_etfs)")
+    parser.add_argument("--start", help="Start date YYYY-MM-DD")
+    parser.add_argument("--end", help="End date YYYY-MM-DD")
+    args = parser.parse_args()
+
+    RUN_NAME, STOCK_FILES, ANCHOR_GROUPS, START, END = load_run_config(args)
+
     # ── 1. Build universe ────────────────────────────────────
     print("=" * 60)
     print("STEP 1: Building universe")
