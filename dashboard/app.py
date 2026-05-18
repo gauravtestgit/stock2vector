@@ -1,9 +1,9 @@
-"""Stock2Vec Dashboard — polished version.
+"""Stock2Vec Dashboard — calls FastAPI server for all operations.
 
-Page 1: Model Overview — clustered heatmap, PCA scatter, loss curve
-Page 2: Stock Query — autocomplete, top N similar, OOV support
+Requires: python server.py running on port 8000
+Run:      python dashboard/app.py
 
-Run: python dashboard/app.py
+Set STOCK2VEC_API_URL env var to override API base URL.
 """
 import sys
 import os
@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pandas as pd
+import requests
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy.cluster.hierarchy import linkage, leaves_list
@@ -23,47 +24,42 @@ import dash_bootstrap_components as dbc
 
 from config.settings import settings
 from src.implementations.training.persistence import NumpyPersistence
-from src.implementations.embeddings.metrics import CosineMetric
-from src.implementations.embeddings.oov import CorrelationOOV
-from src.implementations.pipeline.sources import YFinancePriceSource
-from src.implementations.pipeline.returns import LogReturnsProcessor, MarketNeutralReturnsProcessor
-from src.implementations.pipeline.cache import ParquetCache
+
+API_BASE = os.environ.get("STOCK2VEC_API_URL", "http://127.0.0.1:8000")
 
 persistence = NumpyPersistence()
-metric = CosineMetric()
 
 
-def discover_models():
-    """Find models that trained successfully (have current/ with W1.npy)."""
-    models_dir = settings.models_dir
-    options = []
-    if os.path.exists(models_dir):
-        for name in sorted(os.listdir(models_dir)):
-            current_path = os.path.join(models_dir, name, "current")
-            if os.path.exists(os.path.join(current_path, "W1.npy")):
-                # Load metadata to show useful info in dropdown
-                try:
-                    _, _, meta = persistence.load(current_path)
-                    vocab_size = meta.get("vocab_size", "?")
-                    loss = meta.get("final_loss", 0)
-                    label = f"{name} ({vocab_size} stocks, loss={loss:.3f})"
-                except Exception:
-                    label = name
-                options.append({"label": label, "value": current_path})
-    return options
+# ── Helpers ──────────────────────────────────────────────────
+
+def _api_get(path, **params):
+    try:
+        r = requests.get(f"{API_BASE}{path}", params=params, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
 
-def load_model(model_path):
-    """Load model and compute derived data."""
+def _api_post(path, data):
+    try:
+        r = requests.post(f"{API_BASE}{path}", json=data, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _load_model_for_viz(model_path):
+    """Load model locally for visualisation (heatmap, PCA need raw embeddings)."""
     embeddings, vocab, metadata = persistence.load(model_path)
     t2i = vocab
     i2t = {int(i): t for t, i in vocab.items()}
-    sim_matrix = metric.compute_matrix(embeddings)
-
+    from src.implementations.embeddings.metrics import CosineMetric
+    sim_matrix = CosineMetric().compute_matrix(embeddings)
     pca = PCA(n_components=2, random_state=42)
     coords_2d = pca.fit_transform(embeddings)
 
-    # Load loss history if available
     model_root = os.path.dirname(model_path)
     loss_path = os.path.join(model_root, "loss_history.csv")
     loss_df = None
@@ -76,10 +72,19 @@ def load_model(model_path):
     return embeddings, t2i, i2t, metadata, sim_matrix, coords_2d, pca, loss_df
 
 
-# Initial load
-available_models = discover_models()
-default_model = available_models[0]["value"] if available_models else "data/models/sample/current"
-embeddings, t2i, i2t, metadata, sim_matrix, coords_2d, pca, loss_df = load_model(default_model)
+# ── Initial load ─────────────────────────────────────────────
+
+models_list = _api_get("/api/models") or []
+model_options = [
+    {"label": f"{m['name']} ({m.get('vocab_size','?')} stocks, loss={m.get('final_loss',0):.3f})",
+     "value": m["path"]}
+    for m in models_list
+]
+default_model = model_options[0]["value"] if model_options else "data/models/sample/current"
+embeddings, t2i, i2t, metadata, sim_matrix, coords_2d, pca, loss_df = _load_model_for_viz(default_model)
+
+# Resolve model name from path
+_current_model_name = metadata.get("run_name", "")
 
 # ── App ──────────────────────────────────────────────────────
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY],
@@ -88,8 +93,9 @@ app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY],
 app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
     dcc.Store(id="model-path-store", data=default_model),
+    dcc.Store(id="train-run-store", data=""),
+    dcc.Interval(id="train-poll", interval=2000, n_intervals=0),
 
-    # Navbar
     dbc.NavbarSimple(
         children=[
             dbc.NavItem(dbc.NavLink("Overview", href="/")),
@@ -98,7 +104,7 @@ app.layout = html.Div([
             dbc.NavItem(html.Div([
                 dcc.Dropdown(
                     id="model-selector",
-                    options=available_models,
+                    options=model_options,
                     value=default_model,
                     clearable=False,
                     style={"width": "380px", "color": "#000"},
@@ -111,12 +117,25 @@ app.layout = html.Div([
         dark=True,
     ),
 
-    # Model info bar
     html.Div(id="model-info-bar", className="container-fluid mt-2"),
-
-    # Page content
     html.Div(id="page-content", className="container-fluid mt-3"),
 ])
+
+
+# ── Model switching ──────────────────────────────────────────
+
+@app.callback(
+    Output("model-selector", "options"),
+    Input("train-poll", "n_intervals"),
+)
+def refresh_model_list(n_intervals):
+    """Refresh model list periodically to pick up newly trained models."""
+    models = _api_get("/api/models") or []
+    return [
+        {"label": f"{m['name']} ({m.get('vocab_size','?')} stocks, loss={m.get('final_loss',0):.3f})",
+         "value": m["path"]}
+        for m in models
+    ]
 
 
 @app.callback(
@@ -125,8 +144,9 @@ app.layout = html.Div([
     Input("model-selector", "value"),
 )
 def switch_model(model_path):
-    global embeddings, t2i, i2t, metadata, sim_matrix, coords_2d, pca, loss_df
-    embeddings, t2i, i2t, metadata, sim_matrix, coords_2d, pca, loss_df = load_model(model_path)
+    global embeddings, t2i, i2t, metadata, sim_matrix, coords_2d, pca, loss_df, _current_model_name
+    embeddings, t2i, i2t, metadata, sim_matrix, coords_2d, pca, loss_df = _load_model_for_viz(model_path)
+    _current_model_name = metadata.get("run_name", "")
 
     info = dbc.Alert([
         html.Strong(f"{metadata.get('run_name', '?')}"),
@@ -135,7 +155,6 @@ def switch_model(model_path):
         f" | {metadata.get('start', '?')} → {metadata.get('end', '?')}",
         f" | {metadata.get('pair_count', '?')} pairs",
     ], color="info", className="py-1 mb-0")
-
     return model_path, info
 
 
@@ -153,7 +172,6 @@ def display_page(pathname, model_path):
 # ── Overview Page ────────────────────────────────────────────
 
 def _cluster_order(sim_mat):
-    """Hierarchical clustering order for heatmap."""
     dist = 1 - sim_mat
     np.fill_diagonal(dist, 0)
     dist = np.clip(dist, 0, None)
@@ -165,36 +183,28 @@ def _cluster_order(sim_mat):
 def _build_overview_layout():
     n = len(t2i)
 
-    # Clustered heatmap
     order = _cluster_order(sim_matrix)
     ordered_tickers = [i2t[i] for i in order]
     ordered_matrix = sim_matrix[np.ix_(order, order)]
 
     heatmap_fig = px.imshow(
-        ordered_matrix,
-        x=ordered_tickers, y=ordered_tickers,
-        color_continuous_scale="RdBu_r",
-        zmin=-1, zmax=1, aspect="auto",
+        ordered_matrix, x=ordered_tickers, y=ordered_tickers,
+        color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto",
     )
     heatmap_fig.update_layout(
         title=f"Similarity Matrix (clustered, {n} stocks)",
-        template="plotly_dark",
-        height=max(550, n * 10),
+        template="plotly_dark", height=max(550, n * 10),
     )
-    # Hide tick labels if too many stocks
     if n > 50:
         heatmap_fig.update_xaxes(tickfont=dict(size=7))
         heatmap_fig.update_yaxes(tickfont=dict(size=7))
 
-    # PCA scatter — hover only for large vocab
     ticker_labels = [i2t[i] for i in range(len(embeddings))]
     text_mode = "markers+text" if n <= 30 else "markers"
     scatter_fig = go.Figure(go.Scatter(
         x=coords_2d[:, 0], y=coords_2d[:, 1],
-        mode=text_mode,
-        text=ticker_labels,
-        textposition="top center",
-        textfont=dict(size=8),
+        mode=text_mode, text=ticker_labels,
+        textposition="top center", textfont=dict(size=8),
         marker=dict(size=7, color=coords_2d[:, 0], colorscale="Viridis"),
         hovertemplate="%{text}<br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<extra></extra>",
     ))
@@ -204,18 +214,14 @@ def _build_overview_layout():
         template="plotly_dark", height=550,
     )
 
-    # Loss curve
     loss_chart = html.Div()
     if loss_df is not None and not loss_df.empty:
         loss_fig = go.Figure(go.Scatter(
             x=loss_df["epoch"], y=loss_df["avg_loss"],
             mode="lines", line=dict(color="#2ecc71", width=2),
         ))
-        loss_fig.update_layout(
-            title="Training Loss",
-            xaxis_title="Epoch", yaxis_title="Loss",
-            template="plotly_dark", height=300,
-        )
+        loss_fig.update_layout(title="Training Loss", xaxis_title="Epoch",
+                               yaxis_title="Loss", template="plotly_dark", height=300)
         loss_chart = dcc.Graph(figure=loss_fig)
 
     return html.Div([
@@ -223,9 +229,7 @@ def _build_overview_layout():
             dbc.Col(dcc.Graph(figure=scatter_fig), md=6),
             dbc.Col(dcc.Graph(figure=heatmap_fig), md=6),
         ]),
-        dbc.Row([
-            dbc.Col(loss_chart, md=12),
-        ], className="mt-2"),
+        dbc.Row([dbc.Col(loss_chart, md=12)], className="mt-2"),
     ])
 
 
@@ -233,17 +237,13 @@ def _build_overview_layout():
 
 def _build_query_layout():
     ticker_options = [{"label": t, "value": t} for t in sorted(t2i.keys())]
-
     return html.Div([
         dbc.Row([
             dbc.Col(dbc.Card(dbc.CardBody([
                 html.H5("Stock Query"),
-                dcc.Dropdown(
-                    id="ticker-input",
-                    options=ticker_options,
-                    placeholder="Type or select ticker (e.g., NVDA)",
-                    style={"color": "#000"},
-                ),
+                dcc.Dropdown(id="ticker-input", options=ticker_options,
+                             placeholder="Type or select ticker (e.g., NVDA)",
+                             style={"color": "#000"}),
                 html.Small("Type any ticker — OOV stocks estimated automatically.",
                            className="text-muted mt-1"),
                 html.Div(id="ticker-badge", className="mt-2"),
@@ -256,7 +256,7 @@ def _build_query_layout():
             dbc.Col(dbc.Card(dbc.CardBody([
                 html.H5("OOV Ticker (manual)"),
                 dbc.InputGroup([
-                    dbc.Input(id="oov-input", placeholder="e.g., TSMC, BABA",
+                    dbc.Input(id="oov-input", placeholder="e.g., CRM, UBER",
                               type="text", value="", debounce=True),
                     dbc.Button("Estimate", id="oov-btn", color="warning", n_clicks=0),
                 ]),
@@ -279,7 +279,6 @@ def _build_query_layout():
     State("top-n-slider", "value"),
 )
 def search_ticker(ticker_dropdown, oov_clicks, oov_input, top_n):
-    # Determine which input triggered
     ctx = dash.callback_context
     triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
 
@@ -297,36 +296,37 @@ def search_ticker(ticker_dropdown, oov_clicks, oov_input, top_n):
     oov_info = ""
 
     if ticker in t2i and not force_oov:
+        # In-vocab: call API
         badge = dbc.Badge("IN VOCAB", color="success", className="fs-6")
-        similar = metric.most_similar(ticker, t2i, i2t, embeddings, top_n=top_n)
+        data = _api_get(f"/api/models/{_current_model_name}/similar/{ticker}", top_n=top_n)
+        if data is None:
+            data = []
+        similar = [(d["ticker"], d["similarity"]) for d in data]
     else:
+        # OOV: call API
         badge = dbc.Badge("OOV — ESTIMATING...", color="warning", className="fs-6")
-        result = _estimate_oov(ticker)
-        if result is None:
+        data = _api_get(f"/api/models/{_current_model_name}/oov/{ticker}", top_n=top_n)
+        if data is None:
             badge = dbc.Badge("OOV FAILED", color="danger", className="fs-6")
             fig = go.Figure()
             fig.update_layout(template="plotly_dark",
-                              title=f"Could not estimate '{ticker}' — no price data or co-movement")
-            return fig, badge, "Failed to download prices or find co-movement with vocab stocks."
+                              title=f"Could not estimate '{ticker}'")
+            return fig, badge, "Failed to estimate — no price data or insufficient correlation."
 
-        oov_embedding, oov_meta = result
-        badge = dbc.Badge(f"OOV — {oov_meta.confidence.upper()} CONFIDENCE", color="warning", className="fs-6")
-        similar = []
-        for t, idx in t2i.items():
-            sim = metric.compute(oov_embedding, embeddings[idx])
-            similar.append((t, sim))
-        similar.sort(key=lambda x: -x[1])
-        similar = similar[:top_n]
+        badge = dbc.Badge(f"OOV — {data['confidence'].upper()} CONFIDENCE",
+                          color="warning", className="fs-6")
+        similar = [(d["ticker"], d["similarity"]) for d in data["similar"]]
 
         oov_info = dbc.Card(dbc.CardBody([
             html.H6("OOV Estimation"),
-            html.P([html.Strong("Method: "), oov_meta.method]),
-            html.P([html.Strong("Confidence: "), oov_meta.confidence]),
-            html.P([html.Strong("Co-movement days: "), str(oov_meta.co_movement_days)]),
-            html.P([html.Strong("Data days: "), str(oov_meta.data_days_used)]),
+            html.P([html.Strong("Method: "), data["method"]]),
+            html.P([html.Strong("Confidence: "), data["confidence"]]),
+            html.P([html.Strong("Co-movement days: "), str(data["co_movement_days"])]),
+            html.P([html.Strong("Data days: "), str(data["data_days_used"])]),
             html.Hr(),
-            html.H6("Top Co-movers (by days)"),
-            html.Ul([html.Li(f"{t}: {c:.0f}d") for t, c in oov_meta.top_5_comovers]),
+            html.H6("Top Co-movers"),
+            html.Ul([html.Li(f"{c['ticker']}: {c['correlation']:.3f}")
+                     for c in data["top_comovers"]]),
         ]))
 
     if not similar:
@@ -340,116 +340,44 @@ def search_ticker(ticker_dropdown, oov_clicks, oov_input, top_n):
               for s in sim_scores]
 
     fig = go.Figure(go.Bar(
-        x=sim_scores, y=sim_tickers,
-        orientation="h", marker_color=colors,
-        text=[f"{s:.3f}" for s in sim_scores],
-        textposition="outside",
+        x=sim_scores, y=sim_tickers, orientation="h", marker_color=colors,
+        text=[f"{s:.3f}" for s in sim_scores], textposition="outside",
     ))
     fig.update_layout(
         title=f"Top {top_n} most similar to {ticker}",
-        xaxis_title="Cosine Similarity",
-        xaxis_range=[-0.5, 1.05],
-        template="plotly_dark",
-        height=max(350, top_n * 38),
-        margin=dict(l=80),
+        xaxis_title="Cosine Similarity", xaxis_range=[-0.5, 1.05],
+        template="plotly_dark", height=max(350, top_n * 38), margin=dict(l=80),
     )
     return fig, badge, oov_info
 
 
-def _estimate_oov(ticker):
-    """Estimate OOV embedding."""
-    try:
-        run_name = metadata.get("run_name", "")
-        cache = ParquetCache(settings.raw_dir)
-        cached_prices = cache.read(run_name)
-        if cached_prices is None or cached_prices.empty:
-            return None
-
-        if settings.returns_mode == "market_neutral":
-            returns_proc = MarketNeutralReturnsProcessor(settings.benchmark_ticker)
-        else:
-            returns_proc = LogReturnsProcessor()
-        vocab_returns = returns_proc.compute(cached_prices)
-
-        start = metadata.get("start", "2024-04-01")
-        end = metadata.get("end", "2026-05-10")
-        source = YFinancePriceSource(batch_size=1, retry_count=2,
-                                     retry_wait_secs=2, rate_limit_secs=0.5)
-        tickers_to_fetch = [ticker]
-        if settings.returns_mode == "market_neutral":
-            tickers_to_fetch.append(settings.benchmark_ticker)
-        oov_prices = source.fetch(tickers_to_fetch, start=start, end=end)
-        if oov_prices.empty or ticker not in oov_prices.columns:
-            return None
-
-        oov_returns = returns_proc.compute(oov_prices)[ticker]
-
-        strategy = CorrelationOOV(
-            window_days=settings.correlation_window_days,
-            min_correlation=0.5,
-            step_days=settings.correlation_step_days,
-        )
-        return strategy.estimate(ticker, oov_returns, embeddings, t2i,
-                                 vocab_returns)
-    except Exception:
-        return None
-
-
 # ── Train Page ───────────────────────────────────────────────
 
-import subprocess
-import threading
-import json
-from src.universe.universe import UniverseManager
-
-_training_process = None
-
-
-def _get_stock_files():
-    """List available stock files."""
-    manager = UniverseManager()
-    return manager.list_stock_files()
-
-
-def _get_anchor_groups():
-    """List available anchor groups."""
-    manager = UniverseManager()
-    return manager.list_anchor_groups()
-
-
 def _build_train_layout():
-    stock_files = _get_stock_files()
-    anchor_groups = _get_anchor_groups()
+    stock_files = _api_get("/api/config/stock-files") or []
+    anchor_groups = _api_get("/api/config/anchor-groups") or []
 
     return html.Div([
         dbc.Row([
-            # Config panel
             dbc.Col(dbc.Card(dbc.CardBody([
                 html.H5("Training Configuration"),
                 dbc.Label("Run Name"),
                 dbc.Input(id="train-run-name", type="text", value="new_model",
                           placeholder="e.g., nasdaq_100_v2"),
                 dbc.Label("Stock File", className="mt-2"),
-                dcc.Dropdown(
-                    id="train-stock-file",
-                    options=[{"label": f, "value": f} for f in stock_files],
-                    value=stock_files[0] if stock_files else None,
-                    style={"color": "#000"},
-                ),
+                dcc.Dropdown(id="train-stock-file",
+                             options=[{"label": f, "value": f} for f in stock_files],
+                             value=stock_files[0] if stock_files else None,
+                             style={"color": "#000"}),
                 dbc.Label("Anchor Groups", className="mt-2"),
-                dcc.Dropdown(
-                    id="train-anchor-groups",
-                    options=[{"label": g, "value": g} for g in anchor_groups],
-                    value=["market_etfs", "sector_etfs"],
-                    multi=True,
-                    style={"color": "#000"},
-                ),
+                dcc.Dropdown(id="train-anchor-groups",
+                             options=[{"label": g, "value": g} for g in anchor_groups],
+                             value=["market_etfs", "sector_etfs"],
+                             multi=True, style={"color": "#000"}),
                 dbc.Label("Date Range", className="mt-2"),
                 dbc.Row([
-                    dbc.Col(dbc.Input(id="train-start", type="text", value="2024-04-01",
-                                     placeholder="YYYY-MM-DD"), md=6),
-                    dbc.Col(dbc.Input(id="train-end", type="text", value="2026-05-10",
-                                     placeholder="YYYY-MM-DD"), md=6),
+                    dbc.Col(dbc.Input(id="train-start", type="text", value="2024-04-01"), md=6),
+                    dbc.Col(dbc.Input(id="train-end", type="text", value="2026-05-10"), md=6),
                 ]),
                 dbc.Label("Epochs", className="mt-2"),
                 dbc.Input(id="train-epochs", type="number", value=200),
@@ -462,7 +390,6 @@ def _build_train_layout():
                            className="w-100", n_clicks=0),
             ])), md=4),
 
-            # Progress panel
             dbc.Col(html.Div([
                 dbc.Card(dbc.CardBody([
                     html.H5("Training Progress"),
@@ -472,7 +399,6 @@ def _build_train_layout():
                     html.Div(id="train-loss-info", className="mt-2"),
                 ])),
                 dcc.Graph(id="train-loss-chart", figure=go.Figure()),
-                dcc.Interval(id="train-poll", interval=2000, n_intervals=0),
             ]), md=8),
         ]),
     ])
@@ -483,71 +409,61 @@ def _build_train_layout():
     Output("train-progress", "value"),
     Output("train-loss-info", "children"),
     Output("train-loss-chart", "figure"),
+    Output("train-start-btn", "children", allow_duplicate=True),
     Input("train-poll", "n_intervals"),
-    State("train-run-name", "value"),
+    State("train-run-store", "data"),
+    prevent_initial_call=True,
 )
 def poll_training_progress(n_intervals, run_name):
     if not run_name:
-        return "No training active.", 0, "", go.Figure()
+        return "No training active.", 0, "", go.Figure(), dash.no_update
 
-    status_path = os.path.join(settings.models_dir, run_name, "training_status.json")
-    loss_path = os.path.join(settings.models_dir, run_name, "loss_history.csv")
+    status = _api_get(f"/api/train/{run_name}/status")
+    if status is None:
+        return "Waiting...", 0, "", go.Figure(), dash.no_update
 
-    # Read status
-    status_text = "Waiting..."
-    progress = 0
-    loss_info = ""
+    state = status.get("status", "unknown")
+    btn_text = dash.no_update
+    if state == "running":
+        total = max(status["total_epochs"], 1)
+        progress = int((status["epoch"] + 1) / total * 100)
+        status_text = dbc.Alert(
+            f"Training... Epoch {status['epoch'] + 1}/{status['total_epochs']}",
+            color="info", className="py-1 mb-0")
+        loss_info = f"Current loss: {status['current_loss']:.4f}"
+    elif state == "complete":
+        progress = 100
+        status_text = dbc.Alert(
+            f"Complete! Final loss: {status['final_loss']:.4f}",
+            color="success", className="py-1 mb-0")
+        loss_info = ""
+        btn_text = "Start Training"
+    elif state == "failed":
+        progress = 0
+        status_text = dbc.Alert(
+            f"Failed: {status.get('error', 'unknown')}", color="danger", className="py-1 mb-0")
+        loss_info = ""
+        btn_text = "Start Training"
+    else:
+        return "Waiting...", 0, "", go.Figure(), dash.no_update
 
-    if os.path.exists(status_path):
-        try:
-            with open(status_path) as f:
-                status = json.load(f)
-            state = status.get("status", "unknown")
-            epoch = status.get("current_epoch", 0)
-            total = status.get("total_epochs", 200)
-            loss = status.get("current_loss", 0)
-
-            if state == "running":
-                progress = int((epoch + 1) / total * 100)
-                status_text = dbc.Alert(
-                    f"Training... Epoch {epoch + 1}/{total}",
-                    color="info", className="py-1 mb-0")
-                loss_info = f"Current loss: {loss:.4f}"
-            elif state == "complete":
-                progress = 100
-                final = status.get("final_loss", 0)
-                status_text = dbc.Alert(
-                    f"Complete! Final loss: {final:.4f}",
-                    color="success", className="py-1 mb-0")
-            elif state == "failed":
-                status_text = dbc.Alert(
-                    f"Failed: {status.get('error', 'unknown')}",
-                    color="danger", className="py-1 mb-0")
-        except Exception:
-            pass
-
-    # Read loss curve
+    # Loss chart
     fig = go.Figure()
-    if os.path.exists(loss_path):
-        try:
-            loss_df = pd.read_csv(loss_path)
-            fig.add_trace(go.Scatter(
-                x=loss_df["epoch"], y=loss_df["avg_loss"],
-                mode="lines", line=dict(color="#2ecc71", width=2),
-            ))
-            fig.update_layout(
-                title="Training Loss (live)",
-                xaxis_title="Epoch", yaxis_title="Loss",
-                template="plotly_dark", height=350,
-            )
-        except Exception:
-            pass
+    loss_data = _api_get(f"/api/train/{run_name}/loss")
+    if loss_data:
+        epochs = [d["epoch"] for d in loss_data]
+        losses = [d["avg_loss"] for d in loss_data]
+        fig.add_trace(go.Scatter(x=epochs, y=losses, mode="lines",
+                                 line=dict(color="#2ecc71", width=2)))
+        fig.update_layout(title="Training Loss (live)", xaxis_title="Epoch",
+                          yaxis_title="Loss", template="plotly_dark", height=350)
 
-    return status_text, progress, loss_info, fig
+    return status_text, progress, loss_info, fig, btn_text
 
 
 @app.callback(
     Output("train-start-btn", "children"),
+    Output("train-run-store", "data"),
     Input("train-start-btn", "n_clicks"),
     State("train-run-name", "value"),
     State("train-stock-file", "value"),
@@ -561,37 +477,28 @@ def poll_training_progress(n_intervals, run_name):
 )
 def start_training(n_clicks, run_name, stock_file, anchor_groups, start_date,
                    end_date, epochs, lr, min_corr):
-    global _training_process
+    if not n_clicks or not run_name or not stock_file:
+        return "Start Training", dash.no_update
 
-    if not run_name or not stock_file:
-        return "Start Training"
+    result = _api_post("/api/train", {
+        "run_name": run_name,
+        "stock_file": stock_file,
+        "anchor_groups": anchor_groups or [],
+        "start": start_date,
+        "end": end_date,
+        "epochs": int(epochs),
+        "lr": float(lr),
+        "min_corr": float(min_corr),
+    })
 
-    # Build the training command
-    train_script = os.path.join(os.path.dirname(__file__), "..", "train_from_dashboard.py")
-    cmd = [
-        sys.executable, train_script,
-        "--run-name", run_name,
-        "--stock-file", stock_file,
-        "--anchor-groups", ",".join(anchor_groups or []),
-        "--start", start_date,
-        "--end", end_date,
-        "--epochs", str(epochs),
-        "--lr", str(lr),
-        "--min-corr", str(min_corr),
-    ]
+    if result and "error" in result:
+        return f"Error: {result['error']}", ""
 
-    # Launch as subprocess
-    _training_process = subprocess.Popen(
-        cmd, cwd=os.path.join(os.path.dirname(__file__), ".."),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-
-    return "Training Started..."
+    return "Training Started...", run_name
 
 
 if __name__ == "__main__":
     print("Starting Stock2Vec Dashboard")
-    print(f"  Models: {len(available_models)} available")
-    print(f"  Default: {default_model}")
+    print(f"  API: {API_BASE}")
     print(f"  URL: http://{settings.host}:{settings.port}")
     app.run(host=settings.host, port=settings.port, debug=True)

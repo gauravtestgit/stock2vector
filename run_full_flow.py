@@ -79,6 +79,7 @@ def main():
     parser.add_argument("--anchors", help="Comma-separated anchor groups (e.g., market_etfs,sector_etfs)")
     parser.add_argument("--start", help="Start date YYYY-MM-DD")
     parser.add_argument("--end", help="End date YYYY-MM-DD")
+    parser.add_argument("--quiet", action="store_true", help="Skip verbose output (steps 7-9)")
     args = parser.parse_args()
 
     RUN_NAME, STOCK_FILES, ANCHOR_GROUPS, START, END = load_run_config(args)
